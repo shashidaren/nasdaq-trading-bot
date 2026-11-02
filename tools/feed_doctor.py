@@ -196,10 +196,20 @@ def _verdict(diag, health, witness, quiet):
     if health.get("present") and not health.get("fresh"):
         steps.append("sidecar heartbeat is stale - check: systemctl status mt5feed-nasdaq; "
                      "journalctl -u mt5feed-nasdaq -n 50")
+    last_err = str(health.get("last_error") or "")
+    if "IPC" in last_err.upper() or "-10004" in last_err:
+        steps.append("the sidecar's MT5 handle is dead (No IPC connection) - the terminal or "
+                     "Wine session it attached to restarted while the sidecar kept running: "
+                     "restart the sidecar (systemctl restart mt5feed-nasdaq). If the error "
+                     "persists, the MT5 terminal in this WINEPREFIX is not running/logged in")
     if health.get("status") in ("TICK_FROZEN", "TERMINAL_DISCONNECTED", "NO_TICK"):
         steps.append("terminal has no live ticks: confirm the Wine terminal under the service "
                      "WINEPREFIX is logged in (systemctl show mt5feed-nasdaq -p Environment), "
                      "and check no second terminal is using the same login")
+    if health.get("status") in ("NO_RATES", "INIT_FAILED", "SYMBOL_SELECT_FAILED"):
+        steps.append(f"sidecar is alive but gets no {diag.get('timeframe') or 'M15'} rates "
+                     f"(status {health.get('status')}) - it cannot self-heal from a lost IPC "
+                     "channel, so restart mt5feed-nasdaq and watch its journal")
     if health.get("present") and health.get("server_offset_s") is None and reason != "OK":
         steps.append("sidecar cannot learn the broker UTC offset (needs one fresh tick) - "
                      "fix the terminal connection first")
@@ -210,9 +220,11 @@ def _verdict(diag, health, witness, quiet):
     if reason == FH.REASON_SYMBOL:
         steps.append("a different stack is writing this feed path - give every stack its own "
                      "MT5_FEED_FILE / MT5_WARMUP_FILE / MT5_ORDER_DIR (see docs/STALE-FEED-TRIAGE.md)")
-    if mt5_alive and reason in (FH.REASON_MISSING, FH.REASON_UNREADABLE, FH.REASON_SCHEMA):
-        steps.append("MT5 itself is fine (the quote logger is still recording), so the fault is "
-                     "isolated to the mt5feed service/process - restart it")
+    if mt5_alive and reason != FH.REASON_OK:
+        steps.append("MT5 itself is fine (the quote logger is still recording quotes/candles), so "
+                     "broker connectivity is not the problem - the fault is isolated to the "
+                     "mt5feed-nasdaq service/process; after it recovers, confirm the engine logs "
+                     "new bars (docs/STALE-FEED-TRIAGE.md, resume-after-outage)")
 
     if reason == FH.REASON_OK:
         return ("OK", f"feed healthy - {diag.get('detail')}", steps)
@@ -283,8 +295,13 @@ def _print_detail(report):
         print(f"  ! counter reset at {reset['timestamp']}: {reset['from_minutes']:.0f} min -> "
               f"{reset['to_minutes']:.0f} min ({reset['note']})")
     print()
+    level, _headline, steps = report["verdict"]
+    if not steps:
+        steps = (["none - feed is healthy"] if level == "OK"
+                 else ["no automatic step matched this state - inspect the feed file, the "
+                       "sidecar heartbeat and journal.csv by hand (docs/STALE-FEED-TRIAGE.md)"])
     print("next steps:")
-    for s in report["verdict"][2] or ["none - feed is healthy"]:
+    for s in steps:
         print(f"  - {s}")
 
 

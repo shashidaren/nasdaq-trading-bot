@@ -297,7 +297,8 @@ def engine_problem(lag):
     hours = lag["lag_s"] / 3600.0
     return (f"no bar processed since {lag['watermark_dt']:%Y-%m-%d %H:%M} "
             f"({lag['bars']:.0f} open-market M15 bars / {hours:.1f} h behind the newest "
-            f"XM candle {lag['feed_dt']:%Y-%m-%d %H:%M}) - is nasdaq-engine running?")
+            f"XM candle {lag['feed_dt']:%Y-%m-%d %H:%M}) - the engine is not consuming "
+            "bars; check the feed sidecar first")
 
 
 def _data_collection_number(root):
@@ -568,7 +569,8 @@ def main():
             print(f"  {lag_problem}")
             print("  every key above can match while the engine is dead - its own files"
                   " are the only evidence it was read")
-            print("  triage: systemctl status nasdaq-engine; journalctl -u nasdaq-engine -n 200")
+            print("  triage: python3 tools/feed_doctor.py; systemctl status mt5feed-nasdaq"
+                  " nasdaq-engine; journalctl -u mt5feed-nasdaq -n 100")
     if problems:
         print("\n== doc self-consistency ==")
         for p in problems:
@@ -578,8 +580,8 @@ def main():
         print(f"== result: HANDOFF STALE ({len(stale)} problem(s), "
               f"{len(drift)} advisory) ==")
         if lag_problem and all(s[0] == "engine" for s in stale):
-            print("Fix: the doc already matches the data - the engine is not running."
-                  " Start there, not with --update.")
+            print("Fix: the doc already matches the data - the engine is not getting bars."
+                  " Diagnose the feed sidecar (docs/STALE-FEED-TRIAGE.md §5), not the doc.")
         else:
             print("Fix: python3 tools/handoff_check.py --update   (snapshot block)")
         return 1

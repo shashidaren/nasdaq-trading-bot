@@ -64,6 +64,24 @@ ST_TICK_FROZEN = "TICK_FROZEN"
 ST_OFFSET_UNKNOWN = "OFFSET_UNKNOWN"
 ST_NO_RATES = "NO_RATES"
 
+# Statuses that mean "the MT5 handle we hold is no longer usable" and are worth
+# one bounded shutdown()+initialize(). NO_RATES belongs here: a dead IPC channel
+# (MetaTrader5 error -10004 "No IPC connection", typically after the terminal or
+# the Wine session restarts) makes copy_rates_from_pos return None forever, so a
+# sidecar that only reconnects on TICK_FROZEN can never heal itself - it just
+# keeps heartbeating with a frozen feed file (observed 2026-10-30 -> 2026-11-02).
+# OFFSET_UNKNOWN belongs here too: the offset is learned from a tick, so a dead
+# handle at cold start (no saved offset file) would otherwise stall forever.
+RECONNECT_STATUSES = (ST_TICK_FROZEN, ST_NO_RATES, ST_TERMINAL_DOWN, ST_OFFSET_UNKNOWN)
+
+
+def should_reconnect(status, now_mono: float, last_reconnect_mono: float,
+                     every_s: float = RECONNECT_EVERY_S) -> bool:
+    """One bounded reconnect per `every_s` while the MT5 handle looks dead."""
+    if status not in RECONNECT_STATUSES:
+        return False
+    return (now_mono - float(last_reconnect_mono or 0.0)) >= every_s
+
 
 def _resolve_timeframe(mt5_mod, tf_name: str):
     if mt5_mod is None:
@@ -347,22 +365,25 @@ def main(mt5_mod=None) -> int:
                     last_error = f"copy_rates_from_pos failed: {m.last_error()}"
                     print(f"mt5_feed: no {TIMEFRAME_NAME} data for {SYMBOL}: {last_error}", flush=True)
 
-                # Frozen tick -> one bounded reconnect attempt (never a tight loop).
-                if status == ST_TICK_FROZEN and (now_mono - last_reconnect_mono) >= RECONNECT_EVERY_S:
-                    last_reconnect_mono = now_mono
-                    reconnects += 1
-                    print(f"mt5_feed: reconnect attempt #{reconnects} (shutdown + initialize)", flush=True)
-                    try:
-                        m.shutdown()
-                    except Exception:
-                        pass
-                    try:
-                        if m.initialize():
-                            m.symbol_select(SYMBOL, True)
-                        else:
-                            last_error = f"re-initialize failed: {m.last_error()}"
-                    except Exception as e:
-                        last_error = f"re-initialize error: {e}"
+            # Dead handle (frozen tick / no rates / terminal gone / never learned the
+            # offset) -> one bounded reconnect attempt, never a tight loop. This sits
+            # outside the offset branch because a dead handle also blocks learning the
+            # offset: without it, NO_RATES would heartbeat forever (2026-11-02 incident).
+            if should_reconnect(status, now_mono, last_reconnect_mono):
+                last_reconnect_mono = now_mono
+                reconnects += 1
+                print(f"mt5_feed: reconnect attempt #{reconnects} (shutdown + initialize)", flush=True)
+                try:
+                    m.shutdown()
+                except Exception:
+                    pass
+                try:
+                    if m.initialize():
+                        m.symbol_select(SYMBOL, True)
+                    else:
+                        last_error = f"re-initialize failed: {m.last_error()}"
+                except Exception as e:
+                    last_error = f"re-initialize error: {e}"
 
             write_health(
                 status,

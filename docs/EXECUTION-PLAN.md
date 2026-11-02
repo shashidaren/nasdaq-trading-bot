@@ -2,7 +2,7 @@
 
 **Branch:** the active development branch (`arena/...`); never work on `main` directly
 **Reviewed:** 2026-10-30, **re-reviewed 2026-11-02 12:35 UTC**
-**Status:** **Phase 1 BLOCKED — the engine is not running.** `forward_test_log.csv` and `status.json` have not moved since **2026-10-30 20:45 UTC** (Friday's 16:45 ET bar), while the read-only XM logger kept writing `xm_data/` through **2026-11-02 12:30 UTC**. That is **53 open-market M15 bars (2.7 days) of forward-test evidence that does not exist**, so Phase 2 (sample accumulation) is not merely slow — it is stopped at 1/100 trades. Restore and verify `nasdaq-engine` before any other work. The autosync rollback data-loss hazard (leading hypothesis for the earlier missing candles) is fixed and regression-tested on this branch, but **not yet deployed**: the currently deployed autosync still has the unsafe rollback, so merging to `main` must wait for the controlled deployment procedure (operator-approved; see the Phase 1 notes below and `docs/AUTOSYNC.md`).
+**Status:** **Phase 1 BLOCKED — the feed sidecar lost its MT5 handle (root cause confirmed on the VPS, 2026-11-02 12:44 UTC).** `forward_test_log.csv` and `status.json` have not moved since **2026-10-30 20:45 UTC** (Friday's 16:45 ET bar), while the read-only XM logger kept writing `xm_data/` through **2026-11-02 12:30 UTC**. That is **53 open-market M15 bars (2.7 days) of forward-test evidence that does not exist**, so Phase 2 is stopped at 1/100 trades. `nasdaq-engine` is **not** the fault: it has been `active (running)` since 2026-10-26 and correctly refuses to trade on a stale feed (`MT5: feed stale [CANDLE_OLD]`). The fault is `mt5feed-nasdaq`: heartbeat fresh but `status: NO_RATES`, `last_error: copy_rates_from_pos failed: (-10004, 'No IPC connection')`, `reconnects: 291`, feed file unwritten since **2026-10-31 03:01 UTC**, while `mt5quotes-nasdaq` (separate process, same box) kept publishing. Fix and verification order: `docs/STALE-FEED-TRIAGE.md` §5. The autosync rollback data-loss hazard (leading hypothesis for the earlier missing candles) is fixed and regression-tested on this branch, but **not yet deployed**: the currently deployed autosync still has the unsafe rollback, so merging to `main` must wait for the controlled deployment procedure (operator-approved; see the Phase 1 notes below and `docs/AUTOSYNC.md`).
 
 The checked-in snapshot is **not live telemetry**: `status.json` still records FORWARD_TEST, one closed trade (1W/0L) and a gross engine ledger of $222.70 — as of 2026-10-30 20:45 UTC, i.e. frozen. A historical `feed: OK` in that file does not prove the feed is currently healthy, and a matching HANDOFF snapshot does not prove the engine is alive (before 2026-11-02 every snapshot key was derived from the engine's own frozen files, so `handoff_check.py` reported FRESH throughout the outage; it now fails closed on engine lag).
 
@@ -16,7 +16,7 @@ Goal: make the repo self-describing and the dashboard show a trustworthy readine
 
 | # | Task | Command / Artifact | Acceptance |
 |---|------|-------------------|------------|
-| 1.0 | **Restore the engine** (P0, 2026-11-02) | `/opt/nasdaq`: `systemctl status nasdaq-engine`; `journalctl -u nasdaq-engine -n 200`; `python3 tools/feed_doctor.py`; `systemctl status mt5feed-nasdaq` | Engine processes the current M15 bar: `status.json` `last_update` is within one bar of now, `forward_test_log.csv` grows every 15 min, and `python3 tools/handoff_check.py` no longer reports engine lag. Record the root cause in the Phase 1 notes; do **not** backfill the ledger |
+| 1.0 | **Restore the feed sidecar, then the engine** (P0, 2026-11-02) | `/opt/nasdaq`: `systemctl restart mt5feed-nasdaq`; `journalctl -u mt5feed-nasdaq -f`; `python3 tools/feed_doctor.py`; then confirm the engine resumes (`journalctl -u nasdaq-engine -f`) — runbook: `docs/STALE-FEED-TRIAGE.md` §5 | `feed_doctor.py` → OK; `mt5_warmup_candles.json` refreshed; `status.json` `last_update` within one bar of now; `forward_test_log.csv` grows every 15 min; `python3 tools/handoff_check.py` no longer reports engine lag. Do **not** backfill the ledger, and treat the first ~14 post-outage bars as indicator-contaminated |
 | 1.1 | Refresh HANDOFF snapshot | `python3 tools/handoff_check.py --update` | `docs/HANDOFF.md` snapshot block matches live data (no `[ drift ]` / `[ STALE ]`, no engine lag) |
 | 1.2 | Run full verification ladder | `tools/feed_doctor.py`, `tools/check_data.py`, `tools/smoke_test.py`, `tools/live_path_probe.py` | 0 failures; all warnings investigated, including any CME maintenance-boundary gaps |
 | 1.3 | Verify **Readiness** tab | `dashboard.py` — nav tab + `/readiness` panel | Tab renders the current feed verdict, the same six data gates as `live_readiness.py`, trade stats, readiness verdict and an unsigned non-data checklist |
@@ -53,6 +53,38 @@ Re-ran the ladder in this checkout. **The plan was stale in the specific way tha
 **What this does *not* establish:** the cause. The checked-in files cannot distinguish (a) `nasdaq-engine` stopped/crash-looping, (b) engine running but unable to read `mt5_last_candle.json` (`mt5feed-nasdaq` dead or pointed at another path — quotes and the feed file come from *different* sidecars), or (c) an operator pause. Only `/opt/nasdaq` can answer that; run task 1.0 there.
 
 **Second finding (fixed on this branch):** `handoff_check.py` could not see this outage. Every snapshot key is derived from the engine's own artifacts, and `as_of_utc` came from `status.json`, so a frozen engine produced a perfectly matching snapshot — `HANDOFF FRESH` for 2.7 days. It now compares the newest `xm_data/` candle with the engine watermark and reports **engine lag** in open-market M15 bars: STALE while the market is open (≥ `ENGINE_LAG_BARS` = 8), informational while the market is quiet (a Friday-close-frozen log is normal on Saturday). Missing `xm_data/` degrades to "unknown" rather than a false alarm. Regression: `tests/test_handoff_check.py`.
+
+### Root cause — confirmed on the VPS, 2026-11-02 12:44 UTC
+
+`systemctl status nasdaq-engine` shows `active (running) since 2026-10-26 17:41`, repeating
+`MT5: feed stale [CANDLE_OLD] last closed M15 bar ...` every 60 s, and `journal.csv` holds
+`STALE_FEED` alerts from 2026-11-02 10:10 onward. The engine is healthy and behaving
+correctly. `feed_doctor.py` on `/opt/nasdaq` gives `STALE - CANDLE_OLD`, with:
+
+- `mt5_last_candle.json` — exists, `mtime 2026-10-31 03:01:39`, candle frozen at
+  `2026-10-30 20:45 UTC` → nothing published for ~2.7 days
+- `mt5_feed_health.json` — `status: NO_RATES`, heartbeat 0 s (process alive),
+  `offset 7200`, **`reconnects: 291`**, `last_error: copy_rates_from_pos failed:
+  (-10004, 'No IPC connection')`
+- witness — `xm_data/quotes-2026-11-02.csv` last quote 21 s old, `candles_m15.csv` last
+  bar closed 14 min ago → MT5, Wine and the **quote logger** are all fine
+
+**Diagnosis:** `mt5feed-nasdaq`'s MT5 handle died (the Wine terminal/session it attached to
+restarted while the Python process kept running) and the sidecar could not recover, because
+its bounded `shutdown()+initialize()` path only ran for `TICK_FROZEN` — never for
+`NO_RATES`. So it kept rewriting a fresh heartbeat with a frozen feed file until someone
+looked. `mt5quotes-nasdaq` is a separate process with its own handle, which is exactly why
+the witness stayed healthy and why this looked like "engine stopped" from the repo.
+
+**Fixed on this branch:** `tools/mt5_feed.py` now reconnects on `NO_RATES` /
+`TERMINAL_DISCONNECTED` as well (`should_reconnect()`, still one attempt per
+`MT5_FEED_RECONNECT_S`), and `tools/feed_doctor.py` now turns `NO_RATES` + `-10004` into an
+explicit "restart mt5feed-nasdaq" step instead of printing `none - feed is healthy`
+underneath a STALE verdict. Regression: `tests/test_mt5_feed_reconnect.py`,
+`tests/test_feed_doctor.py`.
+
+**Still required (operator, on the VPS):** `systemctl restart mt5feed-nasdaq`, then verify
+engine resumption — `docs/STALE-FEED-TRIAGE.md` §5.
 
 **Do not:** backfill `forward_test_log.csv` from `xm_data/` to "recover" the 53 bars (that would fabricate forward-test evidence and silently rewrite the record), or count the XM backfill toward the 100-trade gate. The bars are gone; Phase 2 restarts from 1 post-gate trade once the engine is back.
 

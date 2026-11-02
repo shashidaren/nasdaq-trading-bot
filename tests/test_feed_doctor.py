@@ -9,12 +9,15 @@ was actually stale.
 
 Run with ``python3 -m unittest discover -s tests -v``.
 """
+import contextlib
 import importlib.util
+import io
+import json
 import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +106,90 @@ class WitnessCandleAgeTests(unittest.TestCase):
                                           assume_open=True)
         steps = " ".join(report["verdict"][2])
         self.assertIn("MT5 itself is fine", steps)
+
+
+class IpcFailureGuidanceTests(unittest.TestCase):
+    """Regression: a sidecar whose MT5 handle died (error -10004 "No IPC connection").
+
+    Observed on the live VPS 2026-11-02: mt5feed-nasdaq stayed alive and kept
+    heartbeating with status NO_RATES / last_error -10004 while the feed file
+    stayed frozen at 2026-10-30 20:30, and mt5quotes-nasdaq (separate process)
+    was still recording. feed_doctor printed "next steps: - none - feed is
+    healthy" for that STALE verdict because NO_RATES was not handled and the
+    witness rescue only fired for structural reasons.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.xm = self.root / "xm_data"
+        self.xm.mkdir()
+        # frozen feed file: last closed bar opened 20:30, closed 20:45 (Fri)
+        frozen = {"symbol": "US100Cash", "timeframe": "M15", "account": "420568040",
+                  "ts": int(datetime(2026, 10, 30, 20, 30, tzinfo=timezone.utc).timestamp()),
+                  "server_offset_s": 7200, "open": 28403.06, "high": 28413.84,
+                  "low": 28378.65, "close": 28405.03, "tick_volume": 2773}
+        (self.root / "mt5_last_candle.json").write_text(json.dumps(frozen), encoding="utf-8")
+        (self.root / "mt5_feed_health.json").write_text(json.dumps({
+            "status": "NO_RATES", "symbol": "US100Cash", "timeframe": "M15",
+            "account": "420568040", "heartbeat_epoch": NOW_EPOCH,
+            "server_offset_s": 7200, "tick_age_s": None, "reconnects": 291,
+            "last_error": "copy_rates_from_pos failed: (-10004, 'No IPC connection')",
+        }), encoding="utf-8")
+        # live witness: the quote logger is healthy
+        (self.xm / "quotes-2026-10-30.csv").write_text(
+            QUOTES_HEADER + "\n"
+            "2026-10-30 11:59:00,20000,20002.9,2.9,2.9,2.9,6,0,1.0,7200,\n", encoding="utf-8")
+        (self.xm / "candles_m15.csv").write_text(
+            CANDLE_HEADER + "\n" + candle_row("2026-10-30 11:55:00") + "\n", encoding="utf-8")
+        for name in ("quotes-2026-10-30.csv", "candles_m15.csv"):
+            os.utime(self.xm / name, (NOW_EPOCH - 60, NOW_EPOCH - 60))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def report(self):
+        return feed_doctor.build_report(str(self.root), None, now_epoch=NOW_EPOCH,
+                                        assume_open=True)
+
+    def test_stale_verdict_names_the_ipc_failure_and_the_restart(self):
+        level, _headline, steps = self.report()["verdict"]
+        text = " ".join(steps)
+        self.assertEqual(level, "STALE")
+        self.assertIn("No IPC connection", text)
+        self.assertIn("restart mt5feed-nasdaq", text)
+
+    def test_no_rates_status_itself_is_reported(self):
+        text = " ".join(self.report()["verdict"][2])
+        self.assertIn("NO_RATES", text)
+
+    def test_never_claims_healthy_on_a_stale_verdict(self):
+        level, _headline, steps = self.report()["verdict"]
+        self.assertNotEqual(level, "OK")
+        self.assertTrue(steps)
+        self.assertNotIn("none - feed is healthy", " ".join(steps))
+
+    def test_cli_never_prints_none_feed_is_healthy_for_a_stale_feed(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = feed_doctor.main(["--data-dir", str(self.root), "--assume-open"])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("none - feed is healthy", buf.getvalue())
+
+    def test_ok_feed_still_says_healthy(self):
+        # the CLI uses the wall clock, so this fixture must be fresh in real time
+        live_now = datetime.now(timezone.utc)
+        fresh = {"symbol": "US100Cash", "timeframe": "M15", "account": "420568040",
+                 "ts": int((live_now - timedelta(minutes=30)).timestamp()),
+                 "server_offset_s": 7200, "open": 20000.0, "high": 20010.0,
+                 "low": 19990.0, "close": 20005.0, "tick_volume": 100}
+        (self.root / "mt5_last_candle.json").write_text(json.dumps(fresh), encoding="utf-8")
+        (self.root / "mt5_feed_health.json").unlink()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = feed_doctor.main(["--data-dir", str(self.root), "--assume-open"])
+        self.assertEqual(rc, 0)
+        self.assertIn("none - feed is healthy", buf.getvalue())
 
 
 if __name__ == "__main__":
