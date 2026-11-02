@@ -121,3 +121,58 @@ verdict     : OK - feed healthy - last closed bar 2026-10-26 17:45:00 UTC, 3 min
 If `feed_doctor` says `BROKEN` while the quote logger keeps writing, the engine is fine and
 MT5 is fine — only `mt5feed-nasdaq` is not publishing. Never paper over it with a manual
 `echo` into `mt5_last_candle.json`: the engine would trade a bar nobody published.
+
+---
+
+## 5. Resume after a multi-day outage (IPC loss)
+
+Real incident, 2026-10-30 20:45 UTC → 2026-11-02: the *engine* was healthy the whole
+time and correctly refused to trade; `mt5feed-nasdaq` lost its MT5 handle
+(`copy_rates_from_pos failed: (-10004, 'No IPC connection')`, status `NO_RATES`,
+`reconnects: 291`) and never recovered, while `mt5quotes-nasdaq` kept writing quotes
+and candles from a separate process. Symptoms:
+
+| Signal | Reading |
+|---|---|
+| `systemctl status nasdaq-engine` → `active (running)`, log repeats `MT5: feed stale [CANDLE_OLD]` | Engine alive, doing the right thing. Not the fault |
+| `mt5_feed_health.json` → `status: NO_RATES`, heartbeat fresh, `last_error: -10004 No IPC connection` | Sidecar alive, MT5 handle dead |
+| `mt5_last_candle.json` mtime hours/days old | Nothing published since the handle died |
+| `xm_data/quotes-*.csv` current, `feed_doctor` witness fresh | Broker + quote logger fine ⇒ fault is isolated to `mt5feed-nasdaq` |
+
+`-10004` means the Wine MT5 terminal the sidecar attached to restarted or exited;
+the Python process kept a dead handle. Restarting the sidecar is the whole fix:
+
+```bash
+systemctl restart mt5feed-nasdaq
+journalctl -u mt5feed-nasdaq -f        # expect: "publishing closed M15 US100Cash candles"
+python3 tools/feed_doctor.py --quiet   # expect: OK - feed healthy
+```
+
+If `-10004` survives the restart, the terminal in that `WINEPREFIX` is not running or
+not logged in — start it before restarting the sidecar again
+(`systemctl show mt5feed-nasdaq -p Environment`, `docs/NASDAQ-OPS.md`). Since 2026-11-02
+`tools/mt5_feed.py` also reconnects on `NO_RATES`/`TERMINAL_DISCONNECTED`, not only on
+`TICK_FROZEN`, so this no longer needs a manual restart to recover — but the *first*
+attempt at restart is still the fastest confirmation of the diagnosis.
+
+### Then verify the engine, in this order
+
+1. **Feed first.** Confirm `mt5_last_candle.json` is fresh and `mt5_warmup_candles.json`
+   was rewritten (`python3 tools/feed_doctor.py`; warm-up age should be minutes, not days).
+2. **Engine second.** Check `forward_test_log.csv` grows every 15 min and
+   `status.json` `last_update` tracks the current bar.
+3. **Indicators after the gap.** The engine appends the first post-outage bar to its
+   in-memory series, so RSI/ATR/EMA are computed across the gap: ATR picks up the whole
+   weekend/adverse move in one true range and stays inflated for ~14 bars, RSI similarly,
+   EMAs mildly. The engine's gates use ATR (near-EMA distance, min/max ATR), so treat the
+   first ~14 M15 bars (3.5 h) after recovery as indicator-contaminated and review any
+   trade taken in that window by hand. Restarting the engine does **not** remove the gap
+   (`load_history_from_csv()` fills the series from the log, and `load_warmup_from_mt5()`
+   only seeds when the log is empty).
+4. **Never backfill** `forward_test_log.csv` from `xm_data/candles_m15.csv` to hide the
+   gap: that fabricates "the engine evaluated this bar" evidence. The missing bars stay
+   missing, and the sample gate counts only what really ran.
+5. Record the outage window and root cause in `docs/EXECUTION-PLAN.md` Phase 1 notes, and
+   refresh `docs/HANDOFF.md` (`python3 tools/handoff_check.py --update`) — since
+   2026-11-02 `handoff_check.py` fails with `engine lag` when `xm_data/` runs ahead of the
+   engine's own files, so a silent repeat of this outage can no longer pass as FRESH.

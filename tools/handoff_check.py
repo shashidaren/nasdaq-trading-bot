@@ -8,17 +8,28 @@ docs/HANDOFF.md against live data in the repo root.
 Tolerance policy: 5 closed trades and 48 hours (TRADE_TOLERANCE = 5,
 MAX_AGE_HOURS = 48, BAR_TOLERANCE = MAX_AGE_HOURS * 4 = 192 M15 bars).
 
+Engine-lag policy: the snapshot only tracks the engine's own artifacts
+(`forward_test_log.csv`, `trades.csv`, `status.json`). If those stop moving
+while `xm_data/` keeps receiving candles, every key above still matches and
+the gate passes - so the forward test can be dead for days without a warning.
+`newest_xm_bar()`/`engine_lag()` therefore compare the newest XM candle in
+`xm_data/` with the engine watermark and report `engine lag` (default
+ENGINE_LAG_BARS = 8 bars = 2 h). While the market is open that lag is a
+STALE problem; while the market is quiet (weekend / CME maintenance break)
+it is reported for information only, because a frozen log is expected then.
+
 Usage:
   python3 tools/handoff_check.py [repo_root]      # check
   python3 tools/handoff_check.py --update         # rewrite snapshot block in place
   python3 tools/handoff_check.py --quiet          # one-line verdict (digests)
 """
+import glob
 import json
 import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -32,6 +43,10 @@ MAX_AGE_HOURS = 48
 # M15 log rows of drift before STALE = MAX_AGE_HOURS * 4 bars/hour (192 rows).
 BAR_TOLERANCE = MAX_AGE_HOURS * 4
 SKIP_TOLERANCE = 60
+# M15 bars the engine may fall behind the newest XM candle before it counts as
+# stopped/stuck (8 bars = 2 h).
+ENGINE_LAG_BARS = 8
+CANDLE_SECONDS = 900
 
 TRADE_COUNT_KEYS = {"closed_trades", "live_era_trades", "log_covered_trades"}
 OUTCOME_KEYS = {"wins_losses", "win_rate_pct"}
@@ -123,6 +138,167 @@ def live_facts(root, spread=None):
 
     f["data_collection"] = _data_collection_number(root)
     return f
+
+
+def _last_data_row(path, tail_bytes=8192):
+    """(last non-empty line, header field names) of a CSV, reading the tail only."""
+    try:
+        with open(path, "rb") as fh:
+            header_line = fh.readline().decode("utf-8", "replace").strip()
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - tail_bytes))
+            chunk = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None, []
+    lines = [ln for ln in chunk.splitlines() if ln.strip()]
+    if not lines:
+        return None, []
+    header = [c.strip() for c in header_line.split(",")]
+    return lines[-1], header
+
+
+def _row_time(path, columns, tail_bytes=8192):
+    """Timestamp of the newest row in `path` using the first matching column."""
+    row, header = _last_data_row(path, tail_bytes=tail_bytes)
+    if row is None:
+        return None
+    values = [v.strip() for v in row.split(",")]
+    if not header or len(header) != len(values):
+        header, values = [], []
+    pairs = dict(zip(header, values))
+    for col in columns:
+        raw = pairs.get(col)
+        if raw:
+            dt = _parse_utc(raw)
+            if dt is not None:
+                return dt
+    return None
+
+
+def _parse_utc(raw):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(str(raw).strip()[:26], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def newest_xm_bar(root):
+    """Newest XM timestamp in xm_data/ -> (naive UTC datetime, source name).
+
+    `xm_data/candles_m15.csv` is keyed by bar_close_utc; the per-day quote
+    files are keyed by ts_utc. Both are written by the read-only XM logger
+    (tools/mt5_quotes.py), independently of engine.py.
+    """
+    candidates = []
+    candles = os.path.join(root, "xm_data", "candles_m15.csv")
+    if os.path.exists(candles):
+        dt = _row_time(candles, ("bar_close_utc", "Timestamp", "time"))
+        if dt is not None:
+            candidates.append((dt, "candles_m15.csv"))
+    quote_files = sorted(glob.glob(os.path.join(root, "xm_data", "quotes-*.csv")))
+    if quote_files:
+        newest = quote_files[-1]
+        dt = _row_time(newest, ("ts_utc", "timestamp", "time"))
+        if dt is not None:
+            candidates.append((dt, os.path.basename(newest)))
+    if not candidates:
+        return None, None
+    return max(candidates, key=lambda c: c[0])
+
+
+def engine_watermark(facts):
+    """Latest instant the engine demonstrably reached -> (naive UTC datetime, source)."""
+    candidates = []
+    bar = _minute(facts.get("log_last_bar_utc"))
+    if bar is not None:
+        candidates.append((bar, "forward_test_log.csv last bar"))
+    as_of = facts.get("_as_of_dt") or _minute(facts.get("as_of_utc"))
+    if as_of is not None:
+        candidates.append((as_of, "status.json last_update"))
+    if not candidates:
+        return None, None
+    return max(candidates, key=lambda c: c[0])
+
+
+def open_market_bars(start, end):
+    """Count M15 slots in (start, end] that fall inside CME trading hours."""
+    if start is None or end is None or end <= start:
+        return 0
+    bars = 0
+    t = start + timedelta(seconds=CANDLE_SECONDS)
+    while t <= end:
+        if not _market_quiet(t - timedelta(minutes=CANDLE_SECONDS / 2)):
+            bars += 1
+        t += timedelta(seconds=CANDLE_SECONDS)
+    return bars
+
+
+def engine_lag(root, facts, now=None):
+    """Compare the engine watermark with the newest XM data.
+
+    Returns None when either side is missing (e.g. a checkout without xm_data).
+    `bars` counts open-market M15 slots only, so a weekend does not inflate it;
+    `lagging` is True once the engine is ENGINE_LAG_BARS behind the feed.
+    """
+    feed_dt, feed_src = newest_xm_bar(root)
+    mark_dt, mark_src = engine_watermark(facts)
+    if feed_dt is None or mark_dt is None:
+        return None
+    lag_s = (feed_dt - mark_dt).total_seconds()
+    bars = open_market_bars(mark_dt, feed_dt)
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    return {
+        "feed_dt": feed_dt,
+        "feed_src": feed_src,
+        "watermark_dt": mark_dt,
+        "watermark_src": mark_src,
+        "lag_s": lag_s,
+        "bars": bars,
+        "lagging": bars >= ENGINE_LAG_BARS,
+        "market_open": not _market_quiet(now),
+    }
+
+
+_MARKET_CLOCK = []
+
+
+def _market_quiet(naive_utc):
+    """True outside CME US100Cash hours; fail open (False = assume open).
+
+    trade_filter.py lives in the repo root, which is not on sys.path when this
+    file is executed as a script, so add it explicitly before importing.
+    """
+    if not _MARKET_CLOCK:
+        try:
+            for path in (os.path.dirname(HERE), HERE):
+                if path not in sys.path:
+                    sys.path.insert(0, path)
+            from trade_filter import is_market_quiet
+            _MARKET_CLOCK.append(is_market_quiet)
+        except Exception:
+            _MARKET_CLOCK.append(None)
+    is_market_quiet = _MARKET_CLOCK[0]
+    if is_market_quiet is None:
+        return False
+    try:
+        return bool(is_market_quiet(naive_utc.replace(tzinfo=timezone.utc)))
+    except Exception:
+        return False
+
+
+def engine_problem(lag):
+    """A human-readable STALE reason, or None when the lag is not a problem."""
+    if not lag or not lag["lagging"] or not lag["market_open"]:
+        return None
+    hours = lag["lag_s"] / 3600.0
+    return (f"no bar processed since {lag['watermark_dt']:%Y-%m-%d %H:%M} "
+            f"({lag['bars']:.0f} open-market M15 bars / {hours:.1f} h behind the newest "
+            f"XM candle {lag['feed_dt']:%Y-%m-%d %H:%M}) - the engine is not consuming "
+            "bars; check the feed sidecar first")
 
 
 def _data_collection_number(root):
@@ -336,25 +512,40 @@ def main():
             print("  (no values changed)")
         print("  prose numbers are NOT touched - re-read §10's ritual and update"
               " §1/§4/§5/§7 yourself")
+        lag = engine_lag(root, facts)
+        problem = engine_problem(lag)
+        if problem:
+            print(f"  [STALE] {problem}")
+            print("  the snapshot is in sync with the engine's files, but those files"
+                  " are frozen - fix the engine, not the doc")
         return 0
 
     rows = compare(doc, facts)
     problems = doc_consistency(root, doc, text)
+    lag = engine_lag(root, facts)
+    lag_problem = engine_problem(lag)
 
     stale = [r for r in rows if r[3] == "STALE"] + [("doc", "", "", "STALE", p) for p in problems]
     drift = [r for r in rows if r[3] == "DRIFT"]
     if age_h is not None and age_h > MAX_AGE_HOURS:
         stale.append(("as_of_utc", doc.get("as_of_utc"), facts["as_of_utc"],
                       "STALE", f"snapshot is {age_h:.0f} h older than the newest data"))
+    if lag_problem:
+        stale.append(("engine", f"{lag['watermark_dt']:%m-%d %H:%M}",
+                      f"{lag['feed_dt']:%m-%d %H:%M}", "STALE", lag_problem))
 
     if quiet:
+        tail = ""
+        if lag and not lag_problem:
+            tail = (f" | engine lag {lag['bars']:.0f} bars"
+                    + ("" if lag["market_open"] else ", market quiet"))
         if stale:
             first = stale[0]
-            print(f"STALE ({len(stale)} problem(s)): {first[0]} {first[4]}".rstrip())
+            print(f"STALE ({len(stale)} problem(s)): {first[0]} {first[4]}".rstrip() + tail)
         elif drift:
-            print(f"fresh, {len(drift)} advisory drift (data moved since the snapshot)")
+            print(f"fresh, {len(drift)} advisory drift (data moved since the snapshot)" + tail)
         else:
-            print("fresh (snapshot matches the live data)")
+            print("fresh (snapshot matches the live data)" + tail)
         return 1 if stale else 0
 
     print(f"handoff_check - docs/HANDOFF.md vs live data in {root}")
@@ -366,6 +557,20 @@ def main():
         mark = {"OK": "  ok ", "DRIFT": " drift", "STALE": "STALE"}[verdict]
         print(f"  {k:24s} {str(d):>14s} {str(live):>14s}  [{mark}]"
               + (f"  {note}" if note else ""))
+    if lag:
+        mark = "STALE]" if lag_problem else "  ok ]"
+        print("\n== engine vs XM feed (is the forward test still moving?) ==")
+        print(f"  newest XM data   {lag['feed_dt']:%Y-%m-%d %H:%M} ({lag['feed_src']})")
+        print(f"  engine watermark {lag['watermark_dt']:%Y-%m-%d %H:%M} ({lag['watermark_src']})")
+        print(f"  lag              {lag['bars']:.0f} open-market M15 bars"
+              f" ({lag['lag_s'] / 3600:+.1f} h)  [{mark}"
+              + ("" if lag["market_open"] else "  market quiet - informational"))
+        if lag_problem:
+            print(f"  {lag_problem}")
+            print("  every key above can match while the engine is dead - its own files"
+                  " are the only evidence it was read")
+            print("  triage: python3 tools/feed_doctor.py; systemctl status mt5feed-nasdaq"
+                  " nasdaq-engine; journalctl -u mt5feed-nasdaq -n 100")
     if problems:
         print("\n== doc self-consistency ==")
         for p in problems:
@@ -374,7 +579,11 @@ def main():
     if stale:
         print(f"== result: HANDOFF STALE ({len(stale)} problem(s), "
               f"{len(drift)} advisory) ==")
-        print("Fix: python3 tools/handoff_check.py --update   (snapshot block)")
+        if lag_problem and all(s[0] == "engine" for s in stale):
+            print("Fix: the doc already matches the data - the engine is not getting bars."
+                  " Diagnose the feed sidecar (docs/STALE-FEED-TRIAGE.md §5), not the doc.")
+        else:
+            print("Fix: python3 tools/handoff_check.py --update   (snapshot block)")
         return 1
     print(f"== result: HANDOFF FRESH ({len(drift)} advisory drift) ==")
     if drift:

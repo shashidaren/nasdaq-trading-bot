@@ -47,9 +47,9 @@ python3 tools/live_path_probe.py
 # 3. Feed triage (reason + sidecar heartbeat + independent quote-logger witness)
 python3 tools/feed_doctor.py
 
-# 4. Data integrity & HANDOFF snapshot freshness
+# 4. Data integrity, HANDOFF snapshot freshness & engine liveness
 python3 tools/check_data.py
-python3 tools/handoff_check.py
+python3 tools/handoff_check.py    # also reports "engine lag" when xm_data runs ahead of the engine
 
 # 5. XM US100Cash quote/spread/cost/parity report & 12,000-bar M15 historical backtest
 python3 tools/xm_quote_report.py
