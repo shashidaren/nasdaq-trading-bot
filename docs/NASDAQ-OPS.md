@@ -87,7 +87,8 @@ Then confirm the bot identity is current (`git config user.name` should print `n
 cd /opt/nasdaq
 python3 tools/feed_doctor.py           # WHY is the M15 feed stale? (reason + heartbeat + witness)
 python3 tools/check_data.py            # CSV integrity + freshness (market-hours aware)
-python3 tools/handoff_check.py         # docs/HANDOFF.md snapshot vs live data
+python3 tools/handoff_check.py         # docs/HANDOFF.md snapshot vs live data + engine lag vs xm_data
+systemctl status nasdaq-engine mt5feed-nasdaq mt5quotes-nasdaq  # is the engine still writing?
 python3 tools/smoke_test.py            # offline regression suite (uses venv Flask for dashboard tests if available)
 python3 tools/live_path_probe.py       # 11/11 execution-path checks against fake MT5 (no orders sent)
 /opt/nasdaq/venv/bin/python -m unittest discover -s tests -v  # shared gates + Flask dashboard
