@@ -3,8 +3,8 @@
 <!-- HANDOFF-SNAPSHOT machine-checked by tools/handoff_check.py; refresh with --update -->
 | key | value |
 |---|---|
-| as_of_utc | 2026-10-30 10:00 |
-| data_collection | 4764 |
+| as_of_utc | 2026-10-30 20:45 |
+| data_collection | 5062 |
 | closed_trades | 1 |
 | wins_losses | 1W/0L |
 | win_rate_pct | 100.0 |
@@ -13,8 +13,8 @@
 | live_era_trades | 1 |
 | live_era_net_usd | +22.45 |
 | log_covered_trades | 1 |
-| log_bars | 321 |
-| log_last_bar_utc | 2026-10-30 10:00 |
+| log_bars | 364 |
+| log_last_bar_utc | 2026-10-30 20:45 |
 | skip_rows | 0 |
 | open_trade | none |
 | spread_usd_per_trade | 0.25 |
@@ -25,6 +25,8 @@
 ## 1. Executive State (Read First)
 
 This repository auto-trades XM's **Nasdaq-100 Cash Index CFD (`US100Cash`)** on **15-minute (`M15`)** candles under **`/opt/nasdaq`** (cutover date **2026-10-24**; all legacy data discarded).
+
+> **⚠️ 2026-11-02 re-review — the engine is frozen.** `forward_test_log.csv` and `status.json` stop at **2026-10-30 20:45 UTC** (Friday's 16:45 ET bar) while `xm_data/` quotes and candles run through **2026-11-02 12:30 UTC**. That is **53 open-market M15 bars (~2.7 days)** the engine never processed, so the forward test is producing no evidence and `live_readiness.py` is stuck at 1/100 trades. The XM quote logger and MT5 are demonstrably alive (30 s cadence, no gaps, 2.90 pts spread), so the fault is on the engine/feed sidecar, not the broker. Triage on the VPS with `systemctl status nasdaq-engine; journalctl -u nasdaq-engine -n 200` — see `docs/EXECUTION-PLAN.md` task 1.0. Do **not** backfill the forward ledger.
 
 - **Day-0 Nasdaq ledger:** Root `trades.csv`, `forward_test_log.csv`, `skipped_trades.csv`, and `status.json` start clean at **$200.00** equity (`0W/0L`, `symbol: "US100Cash"`, `timeframe: "M15"`).
 - **Execution mode:** `TRADING_MODE = "FORWARD_TEST"` and `DATA_SOURCE = "MT5"` by default. Both the direct `MetaTrader5` path and the Linux Wine atomic file-bridge (`tools/mt5_executor.py` via `/opt/nasdaq/mt5_bridge/`) are implemented. `tools/live_path_probe.py` reports `11/11` checks against **fake MT5 in temporary directories**, not a broker demo. `MT5_EXEC_ENABLED=0` and `MT5_EXEC_ALLOW_REAL=0` remain locked off until the preceding phases and demo validation (`docs/START-LEVER1.md`) complete.
@@ -85,7 +87,7 @@ This repository auto-trades XM's **Nasdaq-100 Cash Index CFD (`US100Cash`)** on 
 
 Follow `docs/EXECUTION-PLAN.md` in order; do not move to demo execution or real money while Phase 1 is blocked.
 
-1. **Verify the live VPS and investigate the forward-log gaps:** Run the §6 ladder on `/opt/nasdaq` and compare missing October 30 open-market M15 slots against the MT5 feed, engine and journal. The checked-in snapshot is not a live-feed health check. Never rewrite the forward log to make a gate pass.
+1. **Restore the engine, then verify the live VPS (P0):** the engine stopped writing after 2026-10-30 20:45 UTC. Run task 1.0 of `docs/EXECUTION-PLAN.md` (`systemctl status nasdaq-engine`, `journalctl -u nasdaq-engine`, `tools/feed_doctor.py`) and the §6 ladder on `/opt/nasdaq`, and compare the older October 30 open-market M15 gaps against the MT5 feed, engine and journal. The checked-in snapshot is not a live-feed health check — and, as of 2026-11-02, a matching snapshot is not proof of a running engine either (`handoff_check.py` now fails closed on that lag). Never rewrite the forward log to make a gate pass.
 2. **Keep accumulating forward-test evidence:** Once Phase 1 is complete, keep `mt5feed-nasdaq` and `nasdaq-engine` healthy and work toward 100 post-gate closed trades. Use the XM historical backtest for context, not as a substitute for forward-test evidence.
 3. **Later, perform the demo soak:** Only after the preceding phases, follow `docs/START-LEVER1.md` on an XM **demo** account, keep `MT5_EXEC_ALLOW_REAL=0`, and verify 5–10 actual demo round-trips plus position reconciliation and HALT flatten. The offline fake-MT5 probe is not that soak.
 
