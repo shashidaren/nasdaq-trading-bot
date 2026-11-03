@@ -12,17 +12,17 @@
   "active_position_id": null,
   "daily_losses": 0,
   "max_daily_losses": 3,
-  "last_update": "2026-11-03 00:30:06",
+  "last_update": "2026-11-03 00:45:06",
   "feed": {
     "ok": true,
     "reason": "OK",
-    "detail": "last closed bar 2026-11-03 00:15:00 UTC, 0 min old",
+    "detail": "last closed bar 2026-11-03 00:30:00 UTC, 0 min old",
     "path": "/opt/nasdaq/mt5_last_candle.json",
     "symbol": "US100Cash",
-    "candle_open_utc": "2026-11-03 00:15:00",
+    "candle_open_utc": "2026-11-03 00:30:00",
     "candle_age_s": 6.1,
-    "frozen_since_utc": "2026-11-03 00:30:00",
-    "file_age_s": 4.8,
+    "frozen_since_utc": "2026-11-03 00:45:00",
+    "file_age_s": 3.2,
     "sidecar": {
       "status": "OK",
       "heartbeat_age_s": 1.2,
@@ -31,12 +31,12 @@
       "server_offset_s": 7200,
       "last_error": null
     },
-    "checked_utc": "2026-11-03 00:30:06"
+    "checked_utc": "2026-11-03 00:45:06"
   },
-  "rsi": 46.3,
-  "ema_fast": 28306.18,
-  "ema_slow": 28745.22,
-  "atr": 82.49,
+  "rsi": 35.5,
+  "ema_fast": 28295.51,
+  "ema_slow": 28738.14,
+  "atr": 78.41,
   "entry_price": null,
   "stop_loss": null,
   "take_profit": null,
@@ -48,10 +48,10 @@
   "entry_ema_fast": null,
   "entry_ema_slow": null,
   "funnel": {
-    "candles_evaluated": 421,
+    "candles_evaluated": 422,
     "tested_floor": 139,
     "valid_rejection": 261,
-    "held_support": 365,
+    "held_support": 366,
     "volume_confirmed": 293,
     "trend_confirmed": 151,
     "slope_confirmed": 124,
@@ -59,10 +59,10 @@
     "all_confirmed": 0,
     "sell_tested_ceiling": 100,
     "sell_valid_rejection": 237,
-    "sell_held_resistance": 384,
-    "sell_trend_confirmed": 219,
-    "sell_slope_confirmed": 235,
-    "sell_price_near_ema": 252,
+    "sell_held_resistance": 385,
+    "sell_trend_confirmed": 220,
+    "sell_slope_confirmed": 236,
+    "sell_price_near_ema": 253,
     "sell_all_confirmed": 1
   }
 }
