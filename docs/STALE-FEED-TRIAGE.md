@@ -155,6 +155,18 @@ not logged in — start it before restarting the sidecar again
 `TICK_FROZEN`, so this no longer needs a manual restart to recover — but the *first*
 attempt at restart is still the fastest confirmation of the diagnosis.
 
+**Since 2026-11-13 `tools/autosync.sh` does this automatically** (phase 3b, every
+15 min): `feed_doctor.py --json` must report `actions.restart_sidecar` =
+`dead-handle` (fresh heartbeat, dead MT5 handle) or `not-running` (feed file and
+heartbeat both missing, systemd not `inactive`), and the verdict must be an
+open-market `STALE`/`BROKEN` — only then is `systemctl restart mt5feed-nasdaq`
+attempted (once per run, `FEED_HEAL_WAIT_S` grace, post-restart re-check with a
+`journalctl` alert if the feed does not recover). Weekends/maintenance (`QUIET`),
+stale heartbeats and path/symbol misconfigurations are **not** auto-restarted;
+`FEED_SELF_HEAL=0` disables the whole path. The manual steps above remain valid
+and are still the fastest confirmation — and are required whenever the digest
+shows `feed service NOT FOUND` or `unit is inactive`.
+
 ### Then verify the engine, in this order
 
 1. **Feed first.** Confirm `mt5_last_candle.json` is fresh and `mt5_warmup_candles.json`

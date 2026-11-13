@@ -192,5 +192,104 @@ class IpcFailureGuidanceTests(unittest.TestCase):
         self.assertIn("none - feed is healthy", buf.getvalue())
 
 
+class RestartActionTests(unittest.TestCase):
+    """actions.restart_sidecar: the machine-readable gate tools/autosync.sh
+    consumes so it never restarts the feed sidecar blindly (phase 3b)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.write_dead_handle()
+
+    def write_dead_handle(self):
+        frozen = {"symbol": "US100Cash", "timeframe": "M15", "account": "1",
+                  "ts": int(datetime(2026, 10, 30, 20, 30, tzinfo=timezone.utc).timestamp()),
+                  "server_offset_s": 7200, "open": 28403.06, "high": 28413.84,
+                  "low": 28378.65, "close": 28405.03, "tick_volume": 2773}
+        (self.root / "mt5_last_candle.json").write_text(json.dumps(frozen), encoding="utf-8")
+        (self.root / "mt5_feed_health.json").write_text(json.dumps({
+            "status": "NO_RATES", "symbol": "US100Cash", "timeframe": "M15",
+            "account": "1", "server_offset_s": 7200, "tick_age_s": None,
+            "reconnects": 291,
+            "last_error": "copy_rates_from_pos failed: (-10004, 'No IPC connection')",
+        }), encoding="utf-8")
+
+    def report(self, now_epoch=NOW_EPOCH, assume_open=True):
+        return feed_doctor.build_report(str(self.root), None, now_epoch=now_epoch,
+                                        assume_open=assume_open)
+
+    def test_fresh_heartbeat_with_dead_handle_recommends_restart(self):
+        # The 2026-11-02 incident exactly: process alive (fresh heartbeat),
+        # MT5 handle dead, feed file frozen -> only a restart fixes this.
+        self.assertEqual(self.report()["actions"]["restart_sidecar"], "dead-handle")
+
+    def test_no_rates_status_alone_is_enough_even_without_ipc_text(self):
+        health = json.loads((self.root / "mt5_feed_health.json").read_text(encoding="utf-8"))
+        health["last_error"] = None
+        (self.root / "mt5_feed_health.json").write_text(json.dumps(health), encoding="utf-8")
+        self.assertEqual(self.report()["actions"]["restart_sidecar"], "dead-handle")
+
+    def test_stale_heartbeat_never_recommends_restart(self):
+        # A heartbeat older than 120 s may be a deliberately stopped process:
+        # automation must not fight an operator stop, so no restart is offered.
+        old = NOW_EPOCH - 3600
+        os.utime(self.root / "mt5_feed_health.json", (old, old))
+        self.assertIsNone(self.report()["actions"]["restart_sidecar"])
+
+    def test_file_missing_with_no_heartbeat_is_not_running(self):
+        (self.root / "mt5_last_candle.json").unlink()
+        (self.root / "mt5_feed_health.json").unlink()
+        rep = self.report()
+        self.assertEqual(rep["feed"]["reason"], "FILE_MISSING")
+        self.assertEqual(rep["actions"]["restart_sidecar"], "not-running")
+
+    def test_file_missing_with_live_heartbeat_is_a_path_problem_not_a_restart(self):
+        # The heartbeat proves the process runs: the feed path is misconfigured
+        # (different MT5_FEED_FILE). Restarting would loop without fixing it.
+        (self.root / "mt5_last_candle.json").unlink()
+        health = json.loads((self.root / "mt5_feed_health.json").read_text(encoding="utf-8"))
+        health["status"] = "OK"
+        health["last_error"] = None
+        (self.root / "mt5_feed_health.json").write_text(json.dumps(health), encoding="utf-8")
+        rep = self.report()
+        self.assertEqual(rep["feed"]["reason"], "FILE_MISSING")
+        self.assertIsNone(rep["actions"]["restart_sidecar"])
+
+    def test_healthy_sidecar_with_old_bar_does_not_recommend_restart(self):
+        # Feed stale but the sidecar reports status OK + fresh heartbeat:
+        # not the dead-handle state; a restart is not the documented fix.
+        health = json.loads((self.root / "mt5_feed_health.json").read_text(encoding="utf-8"))
+        health["status"] = "OK"
+        health["last_error"] = None
+        (self.root / "mt5_feed_health.json").write_text(json.dumps(health), encoding="utf-8")
+        rep = self.report()
+        self.assertIn(rep["verdict"][0], ("STALE", "BROKEN"))
+        self.assertIsNone(rep["actions"]["restart_sidecar"])
+
+    def test_actions_are_reported_even_when_market_quiet(self):
+        # Saturday: verdict is QUIET (autosync applies the open-market gate on
+        # its side), but the dead-handle action itself is still visible.
+        saturday = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc).timestamp()
+        rep = self.report(now_epoch=saturday, assume_open=False)
+        self.assertEqual(rep["verdict"][0], "QUIET")
+        self.assertEqual(rep["actions"]["restart_sidecar"], "dead-handle")
+
+    def test_ok_feed_reports_no_action(self):
+        live_now = datetime.now(timezone.utc)
+        fresh = {"symbol": "US100Cash", "timeframe": "M15", "account": "1",
+                 "ts": int((live_now - timedelta(seconds=1000)).timestamp()),
+                 "server_offset_s": 7200, "open": 20000.0, "high": 20010.0,
+                 "low": 19990.0, "close": 20005.0, "tick_volume": 100}
+        (self.root / "mt5_last_candle.json").write_text(json.dumps(fresh), encoding="utf-8")
+        health = json.loads((self.root / "mt5_feed_health.json").read_text(encoding="utf-8"))
+        health["status"] = "OK"
+        health["last_error"] = None
+        (self.root / "mt5_feed_health.json").write_text(json.dumps(health), encoding="utf-8")
+        rep = self.report(now_epoch=live_now.timestamp(), assume_open=True)
+        self.assertEqual(rep["verdict"][0], "OK")
+        self.assertIsNone(rep["actions"]["restart_sidecar"])
+
+
 if __name__ == "__main__":
     unittest.main()

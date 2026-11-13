@@ -18,11 +18,13 @@ VPS, where this suite runs inside tools/smoke_test.py Scenario S).
 
 Run with ``python3 -m unittest discover -s tests -v``.
 """
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -56,7 +58,13 @@ SEED_FILES = {
     "trade_filter.py": "TF_V1\n",
     "dashboard.py": "DASH_V1\n",
     "pressure.py": "P_V1\n",
-    "feed_health.py": "FH_V1\n",
+    # feed_health.py + tools/feed_doctor.py are copied from the real repo in
+    # setUp: autosync's feed self-heal (phase 3b) gates its sidecar restart on
+    # the doctor's machine-readable `actions` block, so the fixture must run
+    # the REAL doctor against the fixture's feed files.
+    ".gitignore": ("__pycache__/\n*.py[cod]\n"
+                   "mt5_last_candle.json\nmt5_feed_health.json\n"
+                   "mt5_warmup_candles.json\nmt5_feed_offset.json\njournal.csv\n"),
     "tools/smoke_test.py": STUB_SMOKE,
     "tools/check_data.py": STUB_CHECK,
     "trades.csv": "Trade_Num,Trade_Type,Entry_Time\n1,BUY,2026-10-30 04:00:00\n",
@@ -97,6 +105,10 @@ class AutosyncTests(unittest.TestCase):
         self.git(seed, "symbolic-ref", "HEAD", "refs/heads/main")
         for rel, text in SEED_FILES.items():
             self.write(seed, rel, text)
+        # Real feed doctor + its dependency, so phase 3b exercises the actual
+        # doctor-gated restart decision (stub feed_health would break --json).
+        shutil.copy(ROOT / "feed_health.py", seed / "feed_health.py")
+        shutil.copy(ROOT / "tools" / "feed_doctor.py", seed / "tools" / "feed_doctor.py")
         shutil.copy(AUTOSYNC, seed / "tools" / "autosync.sh")
         os.chmod(seed / "tools" / "autosync.sh", 0o755)
         self.git(seed, "add", "-A")
@@ -106,10 +118,36 @@ class AutosyncTests(unittest.TestCase):
         self.upstream = top / "upstream"
         self.git_at(top, "clone", "-q", str(self.origin), str(self.work))
         self.git_at(top, "clone", "-q", str(self.origin), str(self.upstream))
+        # Healthy feed baseline in the "VPS" clone (gitignored runtime files,
+        # so clones never carry them): every test starts from an OK verdict;
+        # the self-heal tests overwrite these two.
+        now = int(time.time())
+        self.write(self.work, "mt5_last_candle.json", json.dumps({
+            "symbol": "US100Cash", "timeframe": "M15", "account": "1",
+            "ts": now - 1000, "server_offset_s": 7200,
+            "open": 20000.0, "high": 20010.0, "low": 19990.0,
+            "close": 20005.0, "tick_volume": 100}))
+        self.write(self.work, "mt5_feed_health.json", json.dumps({
+            "status": "OK", "symbol": "US100Cash", "timeframe": "M15",
+            "account": "1", "server_offset_s": 7200, "tick_age_s": 1.0,
+            "last_error": None}))
         bindir = top / "bin"
         bindir.mkdir()
+        # Hermetic systemctl: logs every call, succeeds only for `restart`
+        # (so the feed self-heal's post-restart re-check runs), reports state
+        # via $SYSTEMCTL_STATE for `is-active`, fails everything else.
         stub = bindir / "systemctl"
-        stub.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        stub.write_text(
+            "#!/bin/sh\n"
+            '[ -n "${SYSTEMCTL_LOG:-}" ] && echo "$@" >> "$SYSTEMCTL_LOG"\n'
+            "case \"$1\" in\n"
+            "  restart) exit 0 ;;\n"
+            "  is-active) if [ -n \"${SYSTEMCTL_STATE:-}\" ] && [ -f \"$SYSTEMCTL_STATE\" ]; then\n"
+            "               cat \"$SYSTEMCTL_STATE\"; exit 0\n"
+            "             fi\n"
+            "             exit 3 ;;\n"
+            "esac\n"
+            "exit 1\n", encoding="utf-8")
         os.chmod(stub, 0o755)
         self.bindir = bindir
 
@@ -152,10 +190,37 @@ class AutosyncTests(unittest.TestCase):
             "DAILY_STAMP": str(Path(self.tmp.name) / "daily.stamp"),
             "ALERT_STAMP": str(Path(self.tmp.name) / "alert.stamp"),
             "NOTIFY": "off", "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "",
+            # Feed self-heal defaults for the fixture: unit pre-detected
+            # (no systemd here) and zero wait so the suite stays fast.
+            "FEED_SERVICE": "mt5feed-nasdaq",
+            "FEED_HEAL_WAIT_S": "0",
+            "SYSTEMCTL_LOG": str(Path(self.tmp.name) / "systemctl.log"),
+            "SYSTEMCTL_STATE": str(Path(self.tmp.name) / "systemctl.state"),
         })
         env.update(extra_env)
         return subprocess.run(["bash", "tools/autosync.sh"], cwd=self.work, env=env,
                               capture_output=True, text=True, timeout=180)
+
+    def systemctl_calls(self):
+        path = Path(self.tmp.name) / "systemctl.log"
+        if not path.exists():
+            return []
+        return path.read_text(encoding="utf-8").splitlines()
+
+    def write_dead_handle_feed(self):
+        """Feed frozen + fresh heartbeat in NO_RATES/-10004: the 2026-11-02
+        incident state where restart is the documented fix (doctor action
+        'dead-handle')."""
+        self.write(self.work, "mt5_last_candle.json", json.dumps({
+            "symbol": "US100Cash", "timeframe": "M15", "account": "1",
+            "ts": 1793361600, "server_offset_s": 7200,
+            "open": 28403.06, "high": 28413.84, "low": 28378.65,
+            "close": 28405.03, "tick_volume": 2773}))
+        self.write(self.work, "mt5_feed_health.json", json.dumps({
+            "status": "NO_RATES", "symbol": "US100Cash", "timeframe": "M15",
+            "account": "1", "server_offset_s": 7200, "tick_age_s": None,
+            "reconnects": 291,
+            "last_error": "copy_rates_from_pos failed: (-10004, 'No IPC connection')"}))
 
     def head(self, rel):
         return self.git(self.work, "show", f"HEAD:{rel}")
@@ -330,6 +395,75 @@ class AutosyncTests(unittest.TestCase):
         self.assertIn("refs/autosync/pre-deploy", text)
         self.assertIn("commit_live_data", text)
         self.assertIn("verify_data_preserved", text)
+
+    # -- feed sidecar self-heal (phase 3b) -------------------------------------
+    def test_healthy_feed_never_touches_the_sidecar(self):
+        self.write(self.work, "forward_test_log.csv", LOCAL_ROW, append=True)
+        proc = self.run_autosync()
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out[-1500:])
+        self.assertIn("feed: OK/- -> OK", out)
+        self.assertFalse(any(c.startswith("restart ") for c in self.systemctl_calls()),
+                         f"systemctl must not restart anything on an OK feed: {self.systemctl_calls()}")
+        self.assertNotIn("feed sidecar", out)
+        self.assert_repo_healthy()
+
+    def test_dead_handle_restarts_sidecar_once_and_verifies(self):
+        # 2026-11-02 incident state: fresh heartbeat, dead MT5 handle, frozen
+        # feed file, market assumed open -> doctor says 'dead-handle', autosync
+        # restarts exactly once and re-checks afterwards.
+        self.write_dead_handle_feed()
+        proc = self.run_autosync()
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out[-1500:])
+        self.assertIn("feed self-heal: STALE/dead-handle - restarting sidecar (mt5feed-nasdaq)", out)
+        # Post-restart re-check ran and still sees the broken state (the stub
+        # cannot actually heal anything) - logged for the operator, plus an
+        # EXTRA digest alert with journalctl guidance (digest-only by design).
+        self.assertIn("feed: STALE/dead-handle -> restarted mt5feed-nasdaq; feed still STALE", out)
+        restarts = [c for c in self.systemctl_calls() if c.startswith("restart ")]
+        self.assertEqual(restarts, ["restart mt5feed-nasdaq"],
+                         "exactly one doctor-gated restart per run")
+        self.assert_repo_healthy()
+
+    def test_feed_self_heal_can_be_disabled(self):
+        self.write_dead_handle_feed()
+        proc = self.run_autosync(FEED_SELF_HEAL="0")
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out[-1500:])
+        self.assertIn("disabled (FEED_SELF_HEAL=0)", out)
+        self.assertFalse(any(c.startswith("restart ") for c in self.systemctl_calls()),
+                         "FEED_SELF_HEAL=0 must never restart the sidecar")
+
+    def test_not_running_unit_restarts_unless_deliberately_stopped(self):
+        # Feed file + heartbeat both missing -> doctor action 'not-running'.
+        # Default stub: is-active reports nothing (failed/unknown) -> restart.
+        (self.work / "mt5_last_candle.json").unlink()
+        (self.work / "mt5_feed_health.json").unlink()
+        proc = self.run_autosync()
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out[-1500:])
+        self.assertIn("feed self-heal: BROKEN/not-running - restarting sidecar (mt5feed-nasdaq)", out)
+        self.assertTrue(any(c.startswith("restart ") for c in self.systemctl_calls()))
+        self.assert_repo_healthy()
+        # Deliberate stop: is-active says 'inactive' -> autosync must not fight it.
+        Path(self.tmp.name, "systemctl.state").write_text("inactive\n", encoding="utf-8")
+        before = len([c for c in self.systemctl_calls() if c.startswith("restart ")])
+        proc = self.run_autosync()
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out[-1500:])
+        self.assertIn("not restarting (deliberate stop?)", out)
+        after = len([c for c in self.systemctl_calls() if c.startswith("restart ")])
+        self.assertEqual(before, after, "an `inactive` unit must not be auto-restarted")
+
+    def test_feed_service_not_detected_alerts_instead_of_guessing(self):
+        self.write_dead_handle_feed()
+        proc = self.run_autosync(FEED_SERVICE="")
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out[-1500:])
+        self.assertIn("feed service NOT FOUND - restart feed sidecar manually", out)
+        self.assertFalse(any(c.startswith("restart ") for c in self.systemctl_calls()),
+                         "without a detected unit autosync must not guess a restart target")
 
 
 if __name__ == "__main__":
