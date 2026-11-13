@@ -181,7 +181,43 @@ def build_report(data_dir, journal_path, now_epoch=None, expected_symbol="US100C
             "counter_resets": resets,
         },
         "verdict": verdict,
+        "actions": _actions(diag, health),
     }
+
+
+def _actions(diag, health):
+    """Machine-readable remediation hints for automation.
+
+    `tools/autosync.sh` consumes ``actions.restart_sidecar`` so it never
+    restarts the feed sidecar blindly (one doctor-gated attempt per run, and
+    only against an open-market STALE/BROKEN verdict - the consumer applies
+    that gate; this function just reports the state):
+
+      "dead-handle"  heartbeat present AND fresh, but the sidecar's MT5 handle
+                     is dead: last_error mentions IPC / -10004, or status is
+                     NO_RATES / INIT_FAILED / SYMBOL_SELECT_FAILED. The process
+                     is alive and cannot self-heal from a lost IPC channel
+                     (the 2026-10-30..2026-11-02 VPS incident) -> systemctl restart.
+      "not-running"  feed file missing AND no heartbeat at all -> the unit is
+                     not running; the consumer restarts it unless systemd
+                     reports a deliberate `inactive` stop.
+      None           nothing automation may restart: healthy feed, market
+                     state the doctor handles itself, a stale heartbeat (the
+                     process may be deliberately stopped), or a configuration
+                     problem (foreign writer / wrong path) where a restart
+                     would loop without fixing anything.
+    """
+    reason = diag.get("reason")
+    last_err = str(health.get("last_error") or "")
+    status = str(health.get("status") or "")
+    dead_states = ("NO_RATES", "INIT_FAILED", "SYMBOL_SELECT_FAILED")
+    if (health.get("present") and health.get("fresh")
+            and ("IPC" in last_err.upper() or "-10004" in last_err
+                 or status in dead_states)):
+        return {"restart_sidecar": "dead-handle"}
+    if reason == FH.REASON_MISSING and not health.get("present"):
+        return {"restart_sidecar": "not-running"}
+    return {"restart_sidecar": None}
 
 
 def _verdict(diag, health, witness, quiet):

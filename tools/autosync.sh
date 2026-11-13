@@ -15,6 +15,22 @@
 #      freshness) and tools/xm_quote_report.py --quiet (XM logger liveness).
 #   4. Optionally sends a digest to Telegram (NOTIFY=off by default).
 #
+# FEED SELF-HEAL (phase 3b, FEED_SELF_HEAL=1 by default):
+#   Every run asks tools/feed_doctor.py --json whether the feed sidecar
+#   (mt5feed-nasdaq) is in a state that ONLY a restart can fix, and restarts it
+#   at most once per run - never blindly:
+#     - actions.restart_sidecar == "dead-handle": heartbeat fresh but the MT5
+#       handle is dead (IPC / -10004 / NO_RATES / INIT_FAILED /
+#       SYMBOL_SELECT_FAILED) - the 2026-10-30..11-02 incident, where the sidecar
+#       heartbeat stayed fresh over a frozen feed file for 2.7 days;
+#     - actions.restart_sidecar == "not-running": feed file and heartbeat both
+#       missing, and systemd does NOT report a deliberate `inactive` stop;
+#   and only against an open-market STALE/BROKEN verdict (QUIET/OK never
+#   restart - weekends and the 16:55-18:10 ET maintenance break are expected
+#   stillness). After a restart it re-checks and alerts if the feed did not
+#   recover; if the restart does not help, the next cron run tries again and
+#   the alert keeps firing. Set FEED_SELF_HEAL=0 to disable auto-restarts.
+#
 # DATA-PRESERVATION CONTRACT (the reason for the helpers below):
 #   The engine and the XM quote logger keep appending to the tracked data
 #   files while this script merges and smoke-tests. The previous rollback ran
@@ -43,6 +59,9 @@ AUTO_DEPLOY="${AUTO_DEPLOY:-1}"
 SMOKE_GATE="${SMOKE_GATE:-1}"
 ENGINE_SERVICE="${ENGINE_SERVICE:-}"
 DASHBOARD_SERVICE="${DASHBOARD_SERVICE:-}"
+FEED_SERVICE="${FEED_SERVICE:-}"
+FEED_SELF_HEAL="${FEED_SELF_HEAL:-1}"
+FEED_HEAL_WAIT_S="${FEED_HEAL_WAIT_S:-20}"
 NOTIFY="${NOTIFY:-off}"
 DAILY_STAMP="${DAILY_STAMP:-/tmp/nasdaq_autosync_daily_digest}"
 ALERT_STAMP="${ALERT_STAMP:-/tmp/nasdaq_autosync_last_alert}"
@@ -242,6 +261,7 @@ verify_data_preserved() {
 }
 
 restore_code_paths_to_head() {
+
     # Make every non-data path match HEAD exactly, restoring files one by one.
     # Data paths are never named here, so a data write racing the rollback
     # cannot be clobbered (unlike the old `git reset --hard`).
@@ -289,6 +309,22 @@ rollback_deploy() {
     fi
     log "rollback: code restored to $pre; live data preserved and verified"
     return 0
+}
+
+feed_doctor_line() {
+    # "<VERDICT>\t<RESTART_ACTION>" from tools/feed_doctor.py --json, or
+    # "ERROR\t-" if the doctor cannot run. The doctor exits 1/2 for
+    # STALE/BROKEN on purpose, so its rc is never used as a gate here.
+    python3 tools/feed_doctor.py --data-dir "$NASDAQ_DIR" --json 2>/dev/null \
+        | python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin)
+    print("{}\t{}".format((r.get("verdict") or ["UNKNOWN"])[0],
+                          (r.get("actions") or {}).get("restart_sidecar") or "-"))
+except Exception:
+    print("ERROR\t-")
+' 2>/dev/null | tail -n 1 || true
 }
 
 # --- lock ---------------------------------------------------------------------
@@ -503,6 +539,87 @@ elif ! git push "$REMOTE" "$BRANCH" >/dev/null 2>&1; then
 fi
 log "push: $PUSH_MSG"
 
+# --- phase 3b: feed sidecar self-heal (doctor-gated, never blind) --------------
+# See the FEED SELF-HEAL note at the top of this file and
+# docs/STALE-FEED-TRIAGE.md §5. One restart attempt at most per run, only for
+# a state that restart is the documented fix for, only while the market is open.
+FEED_MSG="not run"
+if [ "$FEED_SELF_HEAL" != "1" ]; then
+    FEED_MSG="disabled (FEED_SELF_HEAL=0)"
+elif [ ! -f tools/feed_doctor.py ]; then
+    FEED_MSG="not run (tools/feed_doctor.py missing)"
+else
+    FEED_LINE=$(feed_doctor_line)
+    FEED_LEVEL=""
+    FEED_ACTION="-"
+    if [ -n "$FEED_LINE" ]; then
+        IFS=$'\t' read -r FEED_LEVEL FEED_ACTION <<< "$FEED_LINE"
+    fi
+    case "$FEED_LEVEL" in
+        OK|QUIET)
+            FEED_MSG="$FEED_LEVEL" ;;
+        STALE|BROKEN)
+            if [ -z "$FEED_ACTION" ] || [ "$FEED_ACTION" = "-" ]; then
+                # Unhealthy, but not in a state automation may restart (e.g.
+                # stale heartbeat, foreign writer, wrong path): alert only.
+                FEED_MSG="$FEED_LEVEL (no safe auto-restart)"
+                EXTRA="$EXTRA
+⚠️ feed sidecar: $FEED_LEVEL - no safe auto-restart; run python3 tools/feed_doctor.py"
+            else
+                FSVC=$(detect_service 'mt5_feed\.py' "$FEED_SERVICE" || true)
+                DO_RESTART=1
+                if [ "$FEED_ACTION" = "not-running" ]; then
+                    # Distinguish a crashed unit from a deliberate stop:
+                    # is-active prints the state even on a non-zero rc.
+                    FSTATE=$(printf '%s' "$(systemctl is-active "$FSVC" 2>/dev/null || true)" \
+                             | tr -d '[:space:]')
+                    case "$FSTATE" in
+                        inactive|deactivating)
+                            DO_RESTART=0
+                            FEED_MSG="unit is $FSTATE while feed files are missing - not restarting (deliberate stop?)"
+                            EXTRA="$EXTRA
+⚠️ feed sidecar unit is stopped while feed files are missing - start it manually if unintended" ;;
+                    esac
+                fi
+                if [ "$DO_RESTART" = "1" ]; then
+                    if [ -z "$FSVC" ]; then
+                        FEED_MSG="$FEED_LEVEL ($FEED_ACTION) - feed service NOT FOUND - restart feed sidecar manually"
+                        EXTRA="$EXTRA
+⚠️ feed sidecar service not detected - restart mt5feed-nasdaq manually"
+                    else
+                        log "feed self-heal: $FEED_LEVEL/$FEED_ACTION - restarting sidecar ($FSVC)"
+                        if systemctl restart "$FSVC" >/dev/null 2>&1; then
+                            sleep "$FEED_HEAL_WAIT_S"
+                            FEED2=$(feed_doctor_line)
+                            FEED_LEVEL2=""
+                            if [ -n "$FEED2" ]; then
+                                IFS=$'\t' read -r FEED_LEVEL2 _ <<< "$FEED2"
+                            fi
+                            case "$FEED_LEVEL2" in
+                                OK|QUIET)
+                                    FEED_MSG="restarted $FSVC; feed is $FEED_LEVEL2" ;;
+                                *)
+                                    FEED_MSG="restarted $FSVC; feed still ${FEED_LEVEL2:-unknown}"
+                                    EXTRA="$EXTRA
+⚠️ feed sidecar restarted but feed still ${FEED_LEVEL2:-unknown} - journalctl -u $FSVC -n 50 (if -10004 persists: the Wine terminal is not running/logged in)" ;;
+                            esac
+                        else
+                            FEED_MSG="FAILED to restart $FSVC"
+                            EXTRA="$EXTRA
+⚠️ feed sidecar restart FAILED ($FSVC) - systemctl status $FSVC"
+                        fi
+                    fi
+                fi
+            fi
+            ;;
+        *)
+            FEED_MSG="feed_doctor failed to run"
+            EXTRA="$EXTRA
+⚠️ feed_doctor failed during feed self-heal - run python3 tools/feed_doctor.py by hand" ;;
+    esac
+    log "feed: $FEED_LEVEL/$FEED_ACTION -> $FEED_MSG"
+fi
+
 # --- phase 4: integrity + stats ------------------------------------------------
 CHECK_MSG="not run"
 python3 tools/check_data.py >/tmp/nasdaq_autosync_check.log 2>&1
@@ -554,7 +671,7 @@ except Exception as e:
 PYEOF
 )
 
-log "done. data=[$DATA_MSG] deploy=[$DEPLOY_MSG] check=[$CHECK_MSG] handoff=[$HANDOFF_MSG] xm=[$XM_MSG]"
+log "done. data=[$DATA_MSG] deploy=[$DEPLOY_MSG] feed=[$FEED_MSG] check=[$CHECK_MSG] handoff=[$HANDOFF_MSG] xm=[$XM_MSG]"
 
 # --- phase 5: notification policy ----------------------------------------------
 SEND=1
@@ -589,6 +706,7 @@ if [ "$SEND" = "1" ]; then
     tg "🤖 nasdaq autosync${DAILY_TAG} — $(date -u '+%m-%d %H:%M') UTC
 📦 data: $DATA_MSG (push: $PUSH_MSG)
 🚀 deploy: $DEPLOY_MSG
+📡 feed: $FEED_MSG
 🩺 integrity: $CHECK_MSG
 📝 handoff: $HANDOFF_MSG
 📈 $XM_MSG

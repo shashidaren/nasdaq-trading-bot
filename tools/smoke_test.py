@@ -795,6 +795,14 @@ check("O: autosync restarts the dashboard when imported readiness/feed modules c
 check("O: autosync.sh pins git user.name to 'nasdaq-autosync' (a pre-rename clone cannot leak the old identity)",
       'git config user.name "nasdaq-autosync"' in auto_src
       and "git config user.name  >/dev/null 2>&1 ||" not in auto_src)
+check("O: autosync feed self-heal is doctor-gated - never a blind sidecar restart",
+      "FEED_SELF_HEAL" in auto_src
+      and "restart_sidecar" in auto_src
+      and "feed self-heal:" in auto_src
+      and "not restarting (deliberate stop?)" in auto_src
+      and "FEED_HEAL_WAIT_S" in auto_src
+      and auto_src.count("systemctl restart") == 2  # dashboard + gated feed only
+      and 'systemctl restart "$FSVC"' in auto_src)
 _auto_code_lines = [line for line in auto_src.splitlines() if not line.lstrip().startswith("#")]
 check("O: autosync rollback preserves live data - no git reset --hard, soft-reset + verified data commits",
       not any("reset --hard" in line for line in _auto_code_lines)
@@ -1323,6 +1331,15 @@ except Exception as exc:
     _json_ok = False
 check("R: feed_doctor --json is machine-readable for autosync/alerting", _json_ok,
       _doc_json.stdout[:80])
+try:
+    _jr_actions = json.loads(_doc_json.stdout).get("actions")
+    _actions_ok = (isinstance(_jr_actions, dict)
+                   and "restart_sidecar" in _jr_actions
+                   and _jr_actions["restart_sidecar"] is None)   # healthy feed
+except Exception:
+    _actions_ok = False
+check("R: feed_doctor --json exposes actions.restart_sidecar (autosync self-heal gate)",
+      _actions_ok, _doc_json.stdout[:120])
 
 shutil.rmtree(tmp_r, ignore_errors=True)
 
