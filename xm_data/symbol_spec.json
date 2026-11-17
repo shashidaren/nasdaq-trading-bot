@@ -14,7 +14,7 @@
     "trade_expert": true,
     "trade_mode": 2
   },
-  "captured_utc": "2026-11-04 05:43:11",
+  "captured_utc": "2026-11-17 07:54:56",
   "decoded": {
     "account_kind": "REAL",
     "calc_mode": "CFD_LEVERAGE",
@@ -42,12 +42,12 @@
     "swap_triple_day": "FRI",
     "symbol_trade_mode": "FULL"
   },
-  "hash": "ec3cb021bf52",
+  "hash": "f5ff5456f4b6",
   "label": "XM US100Cash",
   "probes": {
-    "calc_margin_usd_0.10lot": 2.8,
+    "calc_margin_usd_0.10lot": 2.73,
     "calc_profit_usd_0.10lot_plus_100pts": 10.0,
-    "price_used": 28040.8
+    "price_used": 27255.18
   },
   "schema": 1,
   "spread_points_now": 290,
@@ -73,12 +73,12 @@
     "spread_float": true,
     "start_time": 0,
     "swap_friday": null,
-    "swap_long": -4.74,
+    "swap_long": -4.94,
     "swap_mode": 3,
     "swap_monday": null,
     "swap_rollover3days": 5,
     "swap_saturday": null,
-    "swap_short": 0.65,
+    "swap_short": 0.69,
     "swap_sunday": null,
     "swap_thursday": null,
     "swap_tuesday": null,
