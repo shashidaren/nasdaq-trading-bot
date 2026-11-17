@@ -91,6 +91,13 @@ alert_once() {
     printf '%s' "$1" > "$ALERT_STAMP" 2>/dev/null || true
 }
 
+critical_alert() {
+    # Repository-integrity failures must never be silently suppressed by
+    # NOTIFY=off. Always log loudly; deliver Telegram too when credentials exist.
+    log "ALERT: $1"
+    tg "🚨 nasdaq autosync: $1"
+}
+
 detect_service() {
     if [ -n "${2:-}" ]; then echo "$2"; return 0; fi
     local unit def
@@ -115,20 +122,48 @@ is_data_path() {
 }
 
 DATA_COMMIT_NOTE=""
+GIT_STATE_FATAL=0
 commit_live_data() {
     # Commit ONLY the live-data paths (worktree content) as the next
     # "data collection N". Returns 0 when the data paths are committed/clean,
     # 1 on failure. `--only` guarantees staged non-data changes are never
     # swept into a data commit by accident.
     DATA_COMMIT_NOTE="no new data"
-    local f
-    for f in "${DATA_FILES[@]}"; do git add -- "$f" 2>/dev/null || true; done
-    if git diff --cached --quiet -- "${DATA_FILES[@]}" 2>/dev/null; then
+    local f diff_rc staged_trades log_subjects new_trades last_n n
+    for f in "${DATA_FILES[@]}"; do
+        if ! git add -- "$f" 2>/dev/null; then
+            DATA_COMMIT_NOTE="GIT ERROR: git add failed for $f"
+            log "$DATA_COMMIT_NOTE"
+            GIT_STATE_FATAL=1
+            return 1
+        fi
+    done
+    git diff --cached --quiet -- "${DATA_FILES[@]}" 2>/dev/null
+    diff_rc=$?
+    if [ "$diff_rc" -eq 0 ]; then
         return 0
+    elif [ "$diff_rc" -ne 1 ]; then
+        DATA_COMMIT_NOTE="GIT ERROR: cached diff failed (rc=$diff_rc)"
+        log "$DATA_COMMIT_NOTE"
+        GIT_STATE_FATAL=1
+        return 1
     fi
-    local new_trades last_n n
-    new_trades=$(git diff --cached -- trades.csv | grep -c '^+[^+]' || true)
-    last_n=$(git log --format=%s | sed -n 's/^data collection \([0-9][0-9]*\)$/\1/p' | sort -n | tail -n1)
+    staged_trades=$(git diff --cached -- trades.csv 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        DATA_COMMIT_NOTE="GIT ERROR: could not inspect staged trades.csv"
+        log "$DATA_COMMIT_NOTE"
+        GIT_STATE_FATAL=1
+        return 1
+    fi
+    new_trades=$(printf '%s\n' "$staged_trades" | grep -c '^+[^+]' || true)
+    log_subjects=$(git log --format=%s 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        DATA_COMMIT_NOTE="GIT ERROR: could not read commit history for data counter"
+        log "$DATA_COMMIT_NOTE"
+        GIT_STATE_FATAL=1
+        return 1
+    fi
+    last_n=$(printf '%s\n' "$log_subjects" | sed -n 's/^data collection \([0-9][0-9]*\)$/\1/p' | sort -n | tail -n1)
     n=$(( ${last_n:-0} + 1 ))
     if git commit -q --only -m "data collection $n" -- "${DATA_FILES[@]}"; then
         DATA_COMMIT_NOTE="committed ${new_trades} new trade rows -> 'data collection $n'"
@@ -137,6 +172,7 @@ commit_live_data() {
     fi
     DATA_COMMIT_NOTE="COMMIT FAILED"
     log "data commit failed"
+    GIT_STATE_FATAL=1
     return 1
 }
 
@@ -261,25 +297,41 @@ verify_data_preserved() {
 }
 
 restore_code_paths_to_head() {
-
     # Make every non-data path match HEAD exactly, restoring files one by one.
     # Data paths are never named here, so a data write racing the rollback
     # cannot be clobbered (unlike the old `git reset --hard`).
-    local f
+    local f paths=".git/autosync-code-paths-$$" sorted=".git/autosync-code-paths-sorted-$$"
+    if ! git diff --name-only -z HEAD > "$paths" 2>/dev/null \
+       || ! git diff --cached --name-only -z HEAD >> "$paths" 2>/dev/null \
+       || ! sort -z -u "$paths" > "$sorted"; then
+        rm -f "$paths" "$sorted"
+        log "rollback: git diff failed while enumerating code paths"
+        return 1
+    fi
     while IFS= read -r -d '' f; do
         is_data_path "$f" && continue
         if git cat-file -e "HEAD:$f" 2>/dev/null; then
-            git checkout HEAD -- "$f" >/dev/null 2>&1 || return 1
+            git checkout HEAD -- "$f" >/dev/null 2>&1 || { rm -f "$paths" "$sorted"; return 1; }
         else
-            git rm -q -f -- "$f" >/dev/null 2>&1 || return 1
+            git rm -q -f -- "$f" >/dev/null 2>&1 || { rm -f "$paths" "$sorted"; return 1; }
         fi
-    done < <({ git diff --name-only -z HEAD 2>/dev/null; git diff --cached --name-only -z HEAD 2>/dev/null; } | sort -z -u)
+    done < "$sorted"
     # Confirm no non-data path still differs from HEAD (staged or unstaged).
+    : > "$paths"
+    if ! git diff --name-only -z HEAD > "$paths" 2>/dev/null \
+       || ! git diff --cached --name-only -z HEAD >> "$paths" 2>/dev/null \
+       || ! sort -z -u "$paths" > "$sorted"; then
+        rm -f "$paths" "$sorted"
+        log "rollback: git diff failed while verifying restored code paths"
+        return 1
+    fi
     while IFS= read -r -d '' f; do
         is_data_path "$f" && continue
         log "rollback: $f still differs from HEAD after code restore"
+        rm -f "$paths" "$sorted"
         return 1
-    done < <({ git diff --name-only -z HEAD 2>/dev/null; git diff --cached --name-only -z HEAD 2>/dev/null; } | sort -z -u)
+    done < "$sorted"
+    rm -f "$paths" "$sorted"
     return 0
 }
 
@@ -333,6 +385,15 @@ if ! flock -n 9; then log "another autosync run is active - skipping"; exit 0; f
 
 cd "$NASDAQ_DIR" || { log "FATAL: cannot cd to $NASDAQ_DIR"; alert_once "fatal-cd|$NASDAQ_DIR" "nasdaq autosync: FATAL - cannot cd to $NASDAQ_DIR"; exit 1; }
 
+# Cheap fail-closed preflight: Git can misleadingly return an empty status and
+# a successful "no diff" result when its object database is damaged. Never
+# interpret those outputs until repository connectivity has been verified.
+if ! git fsck --connectivity-only >/tmp/nasdaq_autosync_fsck.log 2>&1; then
+    FSCK_DETAIL=$(tail -n 20 /tmp/nasdaq_autosync_fsck.log | tr '\n' ' ')
+    critical_alert "repository integrity check FAILED in $NASDAQ_DIR; autosync aborted without touching live data: $FSCK_DETAIL"
+    exit 1
+fi
+
 if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ] || [ -f .git/MERGE_HEAD ]; then
     log "repo is mid rebase/merge - manual attention required"
     alert_once "mid-rebase-merge" "nasdaq autosync: $NASDAQ_DIR is mid rebase/merge. Fix manually; autosync paused."
@@ -361,19 +422,36 @@ if commit_live_data; then
 else
     DATA_MSG="COMMIT FAILED (will retry next run)"
 fi
+if [ "$GIT_STATE_FATAL" = "1" ]; then
+    critical_alert "Git could not safely inspect or commit live data in $NASDAQ_DIR; autosync stopped before fetch/push"
+    exit 1
+fi
 
 # --- phase 2: fetch & (maybe) deploy ------------------------------------------
 git fetch "$REMOTE" "$BRANCH" >/dev/null 2>&1 || log "WARN: git fetch failed (offline/credentials?)"
 
-LOCAL_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
-REMOTE_SHA=$(git rev-parse "$REMOTE/$BRANCH" 2>/dev/null || echo "")
+LOCAL_SHA=$(git rev-parse --verify HEAD 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$LOCAL_SHA" ]; then
+    critical_alert "git rev-parse could not resolve HEAD in $NASDAQ_DIR; autosync aborted"
+    exit 1
+fi
+REMOTE_SHA=$(git rev-parse --verify "$REMOTE/$BRANCH" 2>/dev/null)
+if [ $? -ne 0 ] || [ -z "$REMOTE_SHA" ]; then
+    critical_alert "git rev-parse could not resolve $REMOTE/$BRANCH after fetch; autosync aborted"
+    exit 1
+fi
 
 NEED_MERGE=0
-if [ -n "$REMOTE_SHA" ] && [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
-    if git merge-base --is-ancestor "$REMOTE_SHA" HEAD 2>/dev/null; then
+if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+    git merge-base --is-ancestor "$REMOTE_SHA" HEAD 2>/dev/null
+    MB_RC=$?
+    if [ "$MB_RC" -eq 0 ]; then
         :
-    else
+    elif [ "$MB_RC" -eq 1 ]; then
         NEED_MERGE=1
+    else
+        critical_alert "git merge-base failed (rc=$MB_RC); autosync aborted"
+        exit 1
     fi
 fi
 
@@ -381,18 +459,31 @@ if [ "$NEED_MERGE" = "1" ]; then
     # Staged counts as a hand-edit too: merging over staged code could sweep
     # it into the merge commit or conflict unpredictably. Data paths are not
     # checked here - they are snapshotted by commit_live_data below.
-    if [ -n "$(git status --porcelain --untracked-files=no -- "${CODE_PATHS[@]}" 2>/dev/null)" ]; then
+    CODE_STATUS=$(git status --porcelain --untracked-files=no -- "${CODE_PATHS[@]}" 2>/dev/null)
+    STATUS_RC=$?
+    if [ "$STATUS_RC" -ne 0 ]; then
+        GIT_STATE_FATAL=1
+        DEPLOY_MSG="GIT ERROR - git status failed (rc=$STATUS_RC); deploy skipped"
+        EXTRA+=$'\n🚨 '"$DEPLOY_MSG"
+        log "$DEPLOY_MSG"
+    elif [ -n "$CODE_STATUS" ]; then
         DEPLOY_MSG="SKIPPED - local code edits detected on server (hand-edits are not supported); manual pull needed"
         log "$DEPLOY_MSG"
+    elif [ "$GIT_STATE_FATAL" = "1" ]; then
+        : # state was not trustworthy; fail closed and leave the tree untouched
     elif [ "$AUTO_DEPLOY" != "1" ]; then
         DEPLOY_MSG="SKIPPED (AUTO_DEPLOY=0) - origin/main is ahead; manual pull needed"
         log "$DEPLOY_MSG"
     else
-        CODE_CHANGED=$(git diff --name-only HEAD "$REMOTE_SHA" -- '*.py' | grep -c . || true)
-        CORE_CHANGED=$(git diff --name-only HEAD "$REMOTE_SHA" -- engine.py trade_filter.py | grep -c . || true)
-        # Restart the dashboard when any module it imports changes; otherwise
-        # readiness/feed calculations can remain stale after a successful deploy.
-        DASH_CHANGED=$(git diff --name-only HEAD "$REMOTE_SHA" -- dashboard.py pressure.py feed_health.py trade_filter.py tools/live_readiness.py tools/replay_lib.py | grep -c . || true)
+        CODE_DIFF=$(git diff --name-only HEAD "$REMOTE_SHA" -- '*.py' 2>/dev/null)
+        [ $? -eq 0 ] || { critical_alert "git diff failed while inspecting deploy paths"; exit 1; }
+        CORE_DIFF=$(git diff --name-only HEAD "$REMOTE_SHA" -- engine.py trade_filter.py 2>/dev/null)
+        [ $? -eq 0 ] || { critical_alert "git diff failed while inspecting core deploy paths"; exit 1; }
+        DASH_DIFF=$(git diff --name-only HEAD "$REMOTE_SHA" -- dashboard.py pressure.py feed_health.py trade_filter.py tools/live_readiness.py tools/replay_lib.py 2>/dev/null)
+        [ $? -eq 0 ] || { critical_alert "git diff failed while inspecting dashboard deploy paths"; exit 1; }
+        CODE_CHANGED=$(printf '%s\n' "$CODE_DIFF" | grep -c . || true)
+        CORE_CHANGED=$(printf '%s\n' "$CORE_DIFF" | grep -c . || true)
+        DASH_CHANGED=$(printf '%s\n' "$DASH_DIFF" | grep -c . || true)
         SVC=$(detect_service 'engine\.py' "$ENGINE_SERVICE" || true)
 
         if [ -n "$SVC" ] && [ "$CORE_CHANGED" -gt 0 ]; then
@@ -410,7 +501,11 @@ if [ "$NEED_MERGE" = "1" ]; then
             DEPLOY_MSG="ABORTED - could not snapshot live data before merge (fail-safe; nothing merged)"
             log "$DEPLOY_MSG"
         fi
-        PRE_MERGE=$(git rev-parse HEAD)
+        PRE_MERGE=$(git rev-parse --verify HEAD 2>/dev/null)
+        if [ $? -ne 0 ] || [ -z "$PRE_MERGE" ]; then
+            critical_alert "git rev-parse failed before deploy snapshot; autosync aborted"
+            exit 1
+        fi
         if [ "$DEPLOY_OK" = "1" ]; then
             git update-ref refs/autosync/pre-deploy "$PRE_MERGE" >/dev/null 2>&1 || true
             if ! backup_data_files; then
@@ -424,7 +519,12 @@ if [ "$NEED_MERGE" = "1" ]; then
         SMOKE="not run (no code change)"
         if [ "$DEPLOY_OK" = "1" ]; then
             if ! git merge "$REMOTE/$BRANCH" -m "autosync: merge upstream (live data kept local)" >/dev/null 2>&1; then
-                if [ ! -f .git/MERGE_HEAD ] && [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+                UNMERGED=$(git diff --name-only --diff-filter=U 2>/dev/null)
+                UNMERGED_RC=$?
+                if [ "$UNMERGED_RC" -ne 0 ]; then
+                    log "git diff failed while checking merge conflicts"
+                    MERGE_RC=1
+                elif [ ! -f .git/MERGE_HEAD ] && [ -z "$UNMERGED" ]; then
                     # e.g. a writer dirtied a data file after the snapshot and
                     # git refused to start the merge. Fail safe into rollback,
                     # which commits that data and leaves code untouched.
@@ -440,14 +540,16 @@ if [ "$NEED_MERGE" = "1" ]; then
                     while IFS= read -r f; do
                         [ -z "$f" ] && continue
                         if is_data_path "$f"; then
-                            git checkout --ours -- "$f" >/dev/null 2>&1
+                            git checkout --ours -- "$f" >/dev/null 2>&1 || MERGE_RC=1
                         else
-                            git checkout --theirs -- "$f" >/dev/null 2>&1
+                            git checkout --theirs -- "$f" >/dev/null 2>&1 || MERGE_RC=1
                         fi
-                        git add -- "$f" >/dev/null 2>&1 || true
-                    done < <(git diff --name-only --diff-filter=U)
-                    if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
-                        log "merge conflicts could not be fully resolved"
+                        git add -- "$f" >/dev/null 2>&1 || MERGE_RC=1
+                    done <<< "$UNMERGED"
+                    UNMERGED_AFTER=$(git diff --name-only --diff-filter=U 2>/dev/null)
+                    UNMERGED_AFTER_RC=$?
+                    if [ "$UNMERGED_AFTER_RC" -ne 0 ] || [ -n "$UNMERGED_AFTER" ]; then
+                        log "merge conflicts could not be fully resolved (or git diff failed)"
                         MERGE_RC=1
                     elif [ "$MERGE_RC" = "0" ]; then
                         # Recover any pre-merge-snapshot rows the conflicted
@@ -455,7 +557,7 @@ if [ "$NEED_MERGE" = "1" ]; then
                         # during the seconds the merge sat unresolved cannot
                         # be salvaged safely; see docs/AUTOSYNC.md residuals.)
                         restore_richer_data
-                        for f in "${DATA_FILES[@]}"; do git add -- "$f" 2>/dev/null || true; done
+                        for f in "${DATA_FILES[@]}"; do git add -- "$f" 2>/dev/null || MERGE_RC=1; done
                         git commit -q -m "autosync: merge upstream (live data kept local)" >/dev/null 2>&1 || MERGE_RC=1
                     fi
                 fi
@@ -490,7 +592,12 @@ if [ "$NEED_MERGE" = "1" ]; then
             else
                 # Capture rows written during the smoke run before pushing.
                 commit_live_data || log "WARN: post-deploy data commit failed (data still in worktree; next run retries)"
-                DEPLOY_MSG="deployed $(git rev-parse --short HEAD) (code files: $CODE_CHANGED, smoke: $SMOKE)"
+                DEPLOY_SHORT=$(git rev-parse --short --verify HEAD 2>/dev/null)
+                if [ $? -ne 0 ] || [ -z "$DEPLOY_SHORT" ]; then
+                    critical_alert "git rev-parse failed after deploy; autosync aborted"
+                    exit 1
+                fi
+                DEPLOY_MSG="deployed $DEPLOY_SHORT (code files: $CODE_CHANGED, smoke: $SMOKE)"
                 cleanup_backup
             fi
         fi
@@ -526,9 +633,24 @@ if [ "$NEED_MERGE" = "1" ]; then
     fi
 fi
 
+# Make every deploy failure visible in the existing digest/alert channel. The
+# detailed text remains in DEPLOY_MSG; the EXTRA line ensures ALERTS policy
+# notices skips and failures even when no service/feed warning was emitted.
+case "$DEPLOY_MSG" in
+    none|deployed*)
+        case "$DEPLOY_MSG" in
+            *FAILED*|*STALE*|*NOT\ ACTIVE*|*NOT\ FOUND*|*GIT\ ERROR*|*ABORTED*)
+                EXTRA+=$'\n🚨 deploy: '"$DEPLOY_MSG" ;;
+        esac ;;
+    *) EXTRA+=$'\n⚠️ deploy: '"$DEPLOY_MSG" ;;
+esac
+
 # --- phase 3: push -------------------------------------------------------------
 PUSH_MSG="ok"
-if [ "$DEPLOY_FATAL" = "1" ]; then
+if [ "$GIT_STATE_FATAL" = "1" ]; then
+    PUSH_MSG="SKIPPED - Git state was not trustworthy; manual intervention required"
+    EXTRA+=$'\n🚨 push skipped after Git state error'
+elif [ "$DEPLOY_FATAL" = "1" ]; then
     PUSH_MSG="SKIPPED - rollback could not be verified (fail-safe); manual intervention required"
     EXTRA="$EXTRA
 🚨 push skipped after unverified rollback - inspect $NASDAQ_DIR manually (data backup kept under .git/autosync-backup-*)"
@@ -721,6 +843,10 @@ if [ "$SEND" = "1" ]; then
 💰 $STATS$EXTRA"
 fi
 
+if [ "$GIT_STATE_FATAL" = "1" ]; then
+    critical_alert "autosync stopped because a Git state/commit operation failed; inspect $NASDAQ_DIR and the autosync log"
+    exit 1
+fi
 if [ "$DEPLOY_FATAL" = "1" ]; then
     log "FATAL: deploy rollback could not be verified - manual intervention required (see deploy message above)"
     exit 1

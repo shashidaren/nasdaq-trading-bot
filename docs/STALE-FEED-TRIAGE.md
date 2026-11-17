@@ -51,6 +51,14 @@ journalctl -u mt5feed-nasdaq -n 80 --no-pager
 systemctl show mt5feed-nasdaq -p Environment
 ```
 
+`feed_doctor` also gates on reconnect churn, not just instantaneous candle/heartbeat state:
+at least two reconnects over a sidecar uptime window of 15 minutes or more, at a rate above
+1 reconnect/hour, changes the verdict to `STALE` even if the latest bar is fresh. The JSON
+`reconnect_churn` object reports count, uptime, rate, and threshold. The rate window is the
+current sidecar process lifetime (counter resets on restart); isolated startup reconnects are
+filtered out. Churn alone does not authorize an automatic restart—the existing dead-handle/
+not-running safety rules still apply.
+
 | `mt5_feed_health.json` → `status` | Cause | Fix |
 |---|---|---|
 | `OK` but the bar is old | sidecar healthy, bars not arriving (market shut / broker gap) | check CME hours; if open, `tools/feed_doctor.py` witness block |
