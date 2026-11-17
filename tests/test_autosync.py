@@ -385,6 +385,30 @@ class AutosyncTests(unittest.TestCase):
         self.assertIn("2,SELL,2026-10-30 04:40:00", self.origin_head("trades.csv"))
         self.assert_repo_healthy()
 
+    def test_corrupt_git_preflight_exits_nonzero_and_alerts_without_syncing(self):
+        import shlex
+        real_git = shutil.which("git")
+        shim = self.bindir / "git"
+        calls = Path(self.tmp.name) / "git-shim.log"
+        shim.write_text(
+            "#!/bin/sh\n"
+            f"REAL_GIT={shlex.quote(real_git)}\n"
+            f"echo \"$*\" >> {shlex.quote(str(calls))}\n"
+            "if [ \"$1\" = fsck ]; then echo 'fatal: bad object database' >&2; exit 2; fi\n"
+            "exec \"$REAL_GIT\" \"$@\"\n", encoding="utf-8")
+        os.chmod(shim, 0o755)
+
+        before = self.origin_head("forward_test_log.csv")
+        proc = self.run_autosync()
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out[-2000:])
+        self.assertIn("ALERT: repository integrity check FAILED", out)
+        self.assertIn("aborted without touching live data", out)
+        self.assertEqual(self.origin_head("forward_test_log.csv"), before)
+        self.assertFalse((self.work / ".git" / "index.lock").exists())
+        self.assertEqual(calls.read_text(encoding="utf-8").splitlines(),
+                         ["fsck --connectivity-only"])
+
     def test_no_hard_reset_anywhere(self):
         lines = AUTOSYNC.read_text(encoding="utf-8").splitlines()
         offenders = [l for l in lines
