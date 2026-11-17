@@ -192,6 +192,49 @@ class IpcFailureGuidanceTests(unittest.TestCase):
         self.assertIn("none - feed is healthy", buf.getvalue())
 
 
+class ReconnectChurnGateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        now = datetime.now(timezone.utc)
+        self.now = now.timestamp()
+        feed = {"symbol": "US100Cash", "timeframe": "M15", "account": "1",
+                "ts": int((now - timedelta(minutes=15)).timestamp()),
+                "server_offset_s": 7200, "open": 20000.0, "high": 20010.0,
+                "low": 19990.0, "close": 20005.0, "tick_volume": 100}
+        (self.root / "mt5_last_candle.json").write_text(json.dumps(feed), encoding="utf-8")
+
+    def report(self, reconnects, uptime_s):
+        health = {"status": "OK", "symbol": "US100Cash", "timeframe": "M15",
+                  "account": "1", "heartbeat_epoch": self.now,
+                  "server_offset_s": 7200, "tick_age_s": 1.0,
+                  "reconnects": reconnects, "uptime_s": uptime_s,
+                  "last_error": None}
+        (self.root / "mt5_feed_health.json").write_text(json.dumps(health), encoding="utf-8")
+        return feed_doctor.build_report(str(self.root), None, now_epoch=self.now,
+                                        assume_open=True)
+
+    def test_large_process_lifetime_reconnect_rate_is_stale_even_with_fresh_bar(self):
+        # VPS incident: 3,460 reconnects across 12.5 days is about 11.53/hour.
+        report = self.report(3460, 12.5 * 24 * 3600)
+        self.assertGreater(report["reconnect_churn"]["rate_per_hour"], 1.0)
+        self.assertTrue(report["reconnect_churn"]["degraded"])
+        self.assertEqual(report["verdict"][0], "STALE")
+        self.assertIn("reconnect churn", report["verdict"][1])
+        self.assertIn("11.53/h", " ".join(report["verdict"][2]))
+
+    def test_isolated_reconnect_does_not_trip_gate(self):
+        report = self.report(1, 24 * 3600)
+        self.assertFalse(report["reconnect_churn"]["degraded"])
+        self.assertEqual(report["verdict"][0], "OK")
+
+    def test_short_startup_window_does_not_trip_gate(self):
+        report = self.report(3, 10 * 60)
+        self.assertFalse(report["reconnect_churn"]["degraded"])
+        self.assertEqual(report["verdict"][0], "OK")
+
+
 class RestartActionTests(unittest.TestCase):
     """actions.restart_sidecar: the machine-readable gate tools/autosync.sh
     consumes so it never restarts the feed sidecar blindly (phase 3b)."""

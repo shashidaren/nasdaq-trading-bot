@@ -4,6 +4,8 @@
 
 ## What Every Run Does
 
+Before interpreting any Git output or touching tracked data, autosync runs `git fsck --connectivity-only`. A failure logs a critical alert (and sends Telegram immediately when credentials are configured), exits non-zero, and does not run data commits, fetches, merges, or pushes. The state-reading paths also treat Git command errors as errors, not as empty/clean status or a successful no-diff result. Push/deploy failures are promoted into the notification `EXTRA` path instead of appearing only in the digest body.
+
 1. **Commits live data** (`trades.csv`, `forward_test_log.csv`, `skipped_trades.csv`, `status.json`, `xm_data/`) as `"data collection N"`.
 2. **Fetches `origin/main`:** If `origin/main` advanced (e.g. a merged PR) and `/opt/nasdaq` has no hand-edited code (staged or unstaged):
    - Stops `nasdaq-engine` if `engine.py` or `trade_filter.py` changed.

@@ -787,11 +787,15 @@ check("O: autosync.sh targets /opt/nasdaq and uses static mt5quotes-nasdaq STALE
       "/opt/nasdaq" in auto_src
       and "systemctl status mt5quotes-nasdaq" in auto_src
       and "XM quote logger stopped writing - check: systemctl status mt5quotes-nasdaq" in auto_src)
-_dash_change_line = next((line for line in auto_src.splitlines() if "DASH_CHANGED=$(git diff" in line), "")
+_dash_change_line = next((line for line in auto_src.splitlines() if "DASH_DIFF=$(git diff" in line), "")
 check("O: autosync restarts the dashboard when imported readiness/feed modules change",
       all(path in _dash_change_line for path in ("dashboard.py", "pressure.py", "feed_health.py",
                                                   "trade_filter.py", "tools/live_readiness.py",
                                                   "tools/replay_lib.py")))
+check("O: autosync fails closed on corrupt Git before touching live data",
+      "git fsck --connectivity-only" in auto_src
+      and "repository integrity check FAILED" in auto_src
+      and "GIT ERROR: cached diff failed" in auto_src)
 check("O: autosync.sh pins git user.name to 'nasdaq-autosync' (a pre-rename clone cannot leak the old identity)",
       'git config user.name "nasdaq-autosync"' in auto_src
       and "git config user.name  >/dev/null 2>&1 ||" not in auto_src)

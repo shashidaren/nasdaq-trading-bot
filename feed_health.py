@@ -228,6 +228,7 @@ def diagnose_sidecar_health(path, now_epoch=None, stale_after_s=120) -> dict:
         "account": None,
         "last_error": None,
         "reconnects": None,
+        "uptime_s": None,
     }
     payload, _err = read_json_file(path)
     if payload is None:
@@ -236,7 +237,7 @@ def diagnose_sidecar_health(path, now_epoch=None, stale_after_s=120) -> dict:
     out["age_s"] = file_age_seconds(path, now_epoch)
     out["fresh"] = out["age_s"] is not None and out["age_s"] <= stale_after_s
     for key in ("updated_at", "status", "tick_age_s", "terminal_connected",
-                "server_offset_s", "symbol", "account", "last_error", "reconnects"):
+                "server_offset_s", "symbol", "account", "last_error", "reconnects", "uptime_s"):
         if key in payload:
             out[key] = payload[key]
     return out
