@@ -2,7 +2,7 @@
 
 **Branch:** the active development branch (`arena/...`); never work on `main` directly
 **Reviewed:** 2026-10-30, **re-reviewed 2026-11-02 12:35 UTC, re-re-reviewed 2026-11-13 (checkout ladder green)**
-**Status:** **Phase 1 verification green in this checkout (2026-11-13); VPS-side re-verification and Phase 2 accumulation remain.** The 2026-10-30 feed outage was root-caused on the VPS (2026-11-02 12:44 UTC): `mt5feed-nasdaq`'s MT5 handle died (`status: NO_RATES`, `last_error: copy_rates_from_pos failed: (-10004, 'No IPC connection')`, `reconnects: 291`, feed file unwritten since 2026-10-31 03:01 UTC) and the sidecar's bounded reconnect path only ran for `TICK_FROZEN`, so it kept rewriting a fresh heartbeat over a frozen feed file — while `nasdaq-engine` correctly stayed `active (running)` and refused to trade (`MT5: feed stale [CANDLE_OLD]`), and the separate `mt5quotes-nasdaq` logger kept `xm_data/` alive. The sidecar was restarted and the engine's first post-outage bar is **2026-11-02 12:45 UTC**; evidence now runs through **2026-11-04 08:15 UTC** (529 log bars, data collection 5239, 2 closed trades 1W/1L, gross ledger $213.88). **53 open-market M15 bars (2.7 days, 2026-10-30 20:45 → 2026-11-02 12:45) of forward-test evidence remain permanently lost — do not backfill**; Phase 2 sits at 2/100 post-gate trades (0/6 data gates; feed gate FAIL, worst open-market gap 810 min inside the 14-day window), and the first ~14 post-outage bars are indicator-contaminated. Ladder in this checkout (2026-11-13): `check_data.py` exit 0 (2 warnings investigated: maintenance-adjacent 21:00 UTC slots + the documented outage run), `pytest tests/` 56 passed, `smoke_test.py` scenarios A–S all PASS (Flask installed), `live_path_probe.py` 11/11, `handoff_check.py` **FRESH** after `--update`, dashboard Readiness tab verified on `:6001` (six gates, stats, verdict, unsigned checklist). `feed_doctor.py` still reports `FILE_MISSING /opt/nasdaq` here — **expected in an isolated checkout, and not evidence about the VPS: re-run the ladder on `/opt/nasdaq` every session**, where the last evidence bar and the last GitHub push both stop at **2026-11-04 08:15 UTC** (confirm the pipeline is still moving). The reconnect fix (`should_reconnect()` on `NO_RATES`/`TERMINAL_DISCONNECTED`) and the safe autosync rollback are both present on `main` (5ff4498) with their regression tests; the controlled VPS autosync hand-deploy procedure (operator pauses cron, updates `tools/autosync.sh` by hand, verifies, resumes cron) still applies before relying on auto-deploy (operator-approved; see the Phase 1 notes below and `docs/AUTOSYNC.md`).
+**Status:** **Phase 1 verification green in this checkout (2026-11-13); VPS-side re-verification and Phase 2 accumulation remain.** The 2026-10-30 feed outage was root-caused on the VPS (2026-11-02 12:44 UTC): `mt5feed-nasdaq`'s MT5 handle died (`status: NO_RATES`, `last_error: copy_rates_from_pos failed: (-10004, 'No IPC connection')`, `reconnects: 291`, feed file unwritten since 2026-10-31 03:01 UTC) and the sidecar's bounded reconnect path only ran for `TICK_FROZEN`, so it kept rewriting a fresh heartbeat over a frozen feed file — while `nasdaq-engine` correctly stayed `active (running)` and refused to trade (`MT5: feed stale [CANDLE_OLD]`), and the separate `mt5quotes-nasdaq` logger kept `xm_data/` alive. The sidecar was restarted and the engine's first post-outage bar is **2026-11-02 12:45 UTC**; evidence now runs through **2026-11-04 08:15 UTC** (529 log bars, data collection 5239, 2 closed trades 1W/1L, gross ledger $213.88). **53 open-market M15 bars (2.7 days, 2026-10-30 20:45 → 2026-11-02 12:45) of forward-test evidence remain permanently lost — do not backfill**; Phase 2 sits at 2/100 post-gate trades (0/6 data gates; feed gate FAIL, worst open-market gap 810 min inside the 14-day window), and the first ~14 post-outage bars are indicator-contaminated. Ladder in this checkout (2026-11-13): `check_data.py` exit 0 (2 warnings investigated: maintenance-adjacent 21:00 UTC slots + the documented outage run), `pytest tests/` 56 passed, `smoke_test.py` scenarios A–S all PASS (Flask installed), `live_path_probe.py` 11/11, `handoff_check.py` FRESH after `--update` **at the time — see the 2026-11-17 re-review: that FRESH was a false green once the whole pipeline froze**, dashboard Readiness tab verified on `:6001` (six gates, stats, verdict, unsigned checklist). `feed_doctor.py` still reports `FILE_MISSING /opt/nasdaq` here — **expected in an isolated checkout, and not evidence about the VPS: re-run the ladder on `/opt/nasdaq` every session**, where the last evidence bar and the last GitHub push both stop at **2026-11-04 08:15 UTC** (confirm the pipeline is still moving). The reconnect fix (`should_reconnect()` on `NO_RATES`/`TERMINAL_DISCONNECTED`) and the safe autosync rollback are both present on `main` (5ff4498) with their regression tests; the controlled VPS autosync hand-deploy procedure (operator pauses cron, updates `tools/autosync.sh` by hand, verifies, resumes cron) still applies before relying on auto-deploy (operator-approved; see the Phase 1 notes below and `docs/AUTOSYNC.md`).
 
 The checked-in snapshot is **not live telemetry**: `status.json` records FORWARD_TEST, two closed trades (1W/1L) and a gross engine ledger of $213.88 — as of **2026-11-04 08:15 UTC**, i.e. frozen at the snapshot's `as_of`. A historical `feed: OK` in that file does not prove the feed is currently healthy, and a matching HANDOFF snapshot does not prove the engine is alive (before 2026-11-02 every snapshot key was derived from the engine's own frozen files, so `handoff_check.py` reported FRESH throughout the outage; it now fails closed on engine lag).
 
@@ -52,7 +52,7 @@ Re-ran the ladder in this checkout. **The plan was stale in the specific way tha
 
 **What this does *not* establish:** the cause. The checked-in files cannot distinguish (a) `nasdaq-engine` stopped/crash-looping, (b) engine running but unable to read `mt5_last_candle.json` (`mt5feed-nasdaq` dead or pointed at another path — quotes and the feed file come from *different* sidecars), or (c) an operator pause. Only `/opt/nasdaq` can answer that; run task 1.0 there.
 
-**Second finding (fixed on this branch):** `handoff_check.py` could not see this outage. Every snapshot key is derived from the engine's own artifacts, and `as_of_utc` came from `status.json`, so a frozen engine produced a perfectly matching snapshot — `HANDOFF FRESH` for 2.7 days. It now compares the newest `xm_data/` candle with the engine watermark and reports **engine lag** in open-market M15 bars: STALE while the market is open (≥ `ENGINE_LAG_BARS` = 8), informational while the market is quiet (a Friday-close-frozen log is normal on Saturday). Missing `xm_data/` degrades to "unknown" rather than a false alarm. Regression: `tests/test_handoff_check.py`.
+**Second finding (fixed on this branch):** `handoff_check.py` could not see this outage. Every snapshot key is derived from the engine's own artifacts, and `as_of_utc` came from `status.json`, so a frozen engine produced a perfectly matching snapshot — `HANDOFF FRESH` for 2.7 days. It now compares the newest `xm_data/` candle with the engine watermark and reports **engine lag** in open-market M15 bars: STALE while the market is open (≥ `ENGINE_LAG_BARS` = 8), informational while the market is quiet (a Friday-close-frozen log is normal on Saturday). Regression: `tests/test_handoff_check.py`.
 
 ### Root cause — confirmed on the VPS, 2026-11-02 12:44 UTC
 
@@ -86,6 +86,49 @@ underneath a STALE verdict. Regression: `tests/test_mt5_feed_reconnect.py`,
 **Done (operator, on the VPS):** `mt5feed-nasdaq` was restarted after the 2026-11-02 12:44 UTC root-cause confirmation — the engine's first post-outage bar is 2026-11-02 12:45 UTC and evidence runs to 2026-11-04 08:15 UTC. **Still required every session (operator, on the VPS):** re-run `tools/feed_doctor.py` + the §6 ladder on `/opt/nasdaq`, confirm bars are still arriving (both the last log bar and the last GitHub push stop at 2026-11-04 08:15 UTC in this checkout), and investigate the post-resume 90-minute gap (11-02 21:45→23:15) — `docs/STALE-FEED-TRIAGE.md` §5.
 
 **Do not:** backfill `forward_test_log.csv` from `xm_data/` to "recover" the 53 bars (that would fabricate forward-test evidence and silently rewrite the record), or count the XM backfill toward the 100-trade gate. The bars are gone; Phase 2 continues from the 2 post-gate trades already on the ledger.
+
+### Re-review notes — 2026-11-17 (readiness re-verification; false-FRESH fixed)
+
+Re-ran the ladder. It is green as a *code* baseline but the checkout has been frozen for
+**13 days**, and the previous "Phase 1 verification green" claim was partly an artifact of a
+gate that could not see a fully frozen pipeline.
+
+| Evidence | Value | Reading |
+|---|---|---|
+| `handoff_check.py` (before) | `HANDOFF FRESH`, `age +0.0 h` | **False green.** Age was computed snapshot-vs-frozen-files, and engine-vs-feed lag was 0 because *both* sides stopped |
+| `handoff_check.py` (after) | `HANDOFF STALE`, `wall age 312.2 h`, 819 open-market bars | Correctly fails closed |
+| `check_data.py` | exit 0, 2 warnings | Only inspects file contents; a frozen log passes by design |
+| `pytest tests/` | 74 passed | Baseline green (was 69; 5 new regressions added) |
+| `smoke_test.py` | A–S all PASS | Offline only; not live evidence |
+| `live_path_probe.py` | 11/11 | Fake MT5, not a broker demo |
+| `live_readiness.py --spread 0.25` | exit 1, **0/6** data gates | Unchanged verdict: 2/100 trades, feed-gap FAIL |
+| `feed_doctor.py` | `BROKEN - FILE_MISSING` | Expected in an isolated checkout, not evidence about the VPS |
+
+**Fixed on this branch (tooling correctness — none of it creates trading evidence):**
+
+1. **`handoff_check.py` `engine_lag()` had the same class of blind spot one level up.** The
+   2026-11-02 fix compared the engine watermark with the newest XM candle, which catches
+   "engine dead, logger alive". It could not catch "everything dead": when `mt5feed-nasdaq`
+   *and* `mt5quotes-nasdaq` both stop, watermark and feed match exactly, `age` is `+0.0 h`,
+   and the gate printed FRESH for 13 days. It now also compares the newest evidence (the later
+   of engine watermark and XM data) with the **wall clock** and distinguishes
+   `stale = "engine"` from `stale = "stale"` in the message. A checkout with no `xm_data/` is
+   no longer "unknown" when the log itself is days old. Renamed the reporting field to
+   `engine lag` and added a `newest evidence` line.
+2. **`handoff_check.py --update` exited 0 while stamping a frozen snapshot.** It now prints the
+   STALE reason and **exits 1** — the block is still rewritten (it should honestly reflect the
+   files), but the run does not report success.
+3. **`data_collection` was reported as `0` in any shallow clone** (it scraped `git log` with
+   `-n 50`, and agent checkouts are shallow). `--update` then overwrote a real `5239` with `0`,
+   destroying evidence. `_data_collection_number()` now widens the search and returns `None`
+   when unknown, and `live_facts()` keeps the existing doc value in that case.
+4. **`autosync.sh` silently downgraded a STALE handoff to a log line.** It now raises an
+   `EXTRA` alert like `check_data.py` does, so a frozen pipeline pages instead of passing quietly.
+
+**Still true and still the operator's job:** the VPS must be re-checked with task 1.0 and the
+§6 ladder. Nothing above is evidence that the live pipeline is running; 814 of the 819 missing
+open-market bars are *not* explainable by market closure and must be treated as lost
+forward-test evidence — do not backfill.
 
 ---
 
