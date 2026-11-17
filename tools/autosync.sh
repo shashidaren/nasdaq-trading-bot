@@ -643,6 +643,14 @@ if [ -f tools/handoff_check.py ] && [ -f docs/HANDOFF.md ]; then
         [ -z "$HANDOFF_MSG" ] && HANDOFF_MSG="handoff_check failed to run"
     fi
     log "handoff: $HANDOFF_MSG"
+    # A STALE handoff means the snapshot no longer describes the present: the
+    # pipeline is frozen or the ledger moved far past the doc. That is a
+    # readiness problem, not just a reminder to run --update.
+    case "$HANDOFF_MSG" in
+        "STALE"*)
+            EXTRA="$EXTRA
+⚠️ handoff STALE: $HANDOFF_MSG - the snapshot is not a current readiness picture" ;;
+    esac
 fi
 
 # --- phase 4c: XM logger liveness (ADVISORY) -----------------------------------

@@ -204,12 +204,26 @@ class EngineLagTests(unittest.TestCase):
         finally:
             repo.cleanup()
 
-    def test_missing_xm_data_is_unknown_not_a_problem(self):
+    def test_no_evidence_at_all_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(HC.engine_lag(tmp, {}, now=MON_NOW))
+            self.assertIsNone(HC.engine_problem(None))
+
+    def test_frozen_pipeline_without_xm_data_is_still_stale(self):
+        """A checkout with no xm_data but a 2.7-day-old log is not "unknown".
+
+        The wall-clock comparison needs no xm_data, and treating this as
+        unknown was the same blind spot that let a 13-day-dead pipeline pass.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             facts = {"log_last_bar_utc": "2026-10-30 20:45",
                      "_as_of_dt": datetime(2026, 10, 30, 20, 45)}
-            self.assertIsNone(HC.engine_lag(tmp, facts, now=MON_NOW))
-            self.assertIsNone(HC.engine_problem(None))
+            lag = HC.engine_lag(tmp, facts, now=MON_NOW)
+            self.assertIsNotNone(lag)
+            self.assertEqual(lag["stale"], "stale")
+            self.assertTrue(lag["lagging"])
+            self.assertIsNone(lag["feed_dt"])
+            self.assertIn("pipeline looks frozen", HC.engine_problem(lag))
 
     def test_engine_ahead_of_feed_is_not_lagging(self):
         repo = LagRepo(candles_until=MON_NOW, quotes_until=MON_NOW,
@@ -220,6 +234,63 @@ class EngineLagTests(unittest.TestCase):
             self.assertFalse(lag["lagging"])
         finally:
             repo.cleanup()
+
+    def test_frozen_pipeline_watermark_matching_feed_is_still_stale(self):
+        """The 2026-11-04 -> 2026-11-17 regression.
+
+        Engine and XM logger both stop, so the watermark matches the feed
+        exactly and the old relative-age check read "+0.0 h" and FRESH. Only
+        the wall clock can see this; it must report the whole-pipeline stop.
+        """
+        repo = LagRepo(candles_until=MON_NOW, quotes_until=MON_NOW,
+                       watermark=MON_NOW)
+        try:
+            lag = repo.lag(now=MON_NOW + HC.timedelta(days=11))  # Fri 11-13, market open
+            self.assertEqual(lag["engine_bars"], 0)
+            self.assertGreaterEqual(lag["evidence_bars"], HC.ENGINE_LAG_BARS)
+            self.assertEqual(lag["stale"], "stale")
+            self.assertTrue(lag["lagging"])
+            problem = HC.engine_problem(lag)
+            self.assertIn("pipeline looks frozen", problem)
+            self.assertIn("neither", problem)
+        finally:
+            repo.cleanup()
+
+    def test_engine_only_halt_still_reports_the_engine(self):
+        """Distinguish "engine dead, logger alive" from "everything frozen"."""
+        repo = LagRepo(candles_until=MON_NOW, quotes_until=MON_NOW,
+                       watermark=FRI_CLOSE)
+        try:
+            lag = repo.lag(now=MON_NOW)
+            self.assertEqual(lag["stale"], "engine")
+            self.assertEqual(lag["evidence_bars"], 0)
+            self.assertIn("check the feed sidecar", HC.engine_problem(lag))
+        finally:
+            repo.cleanup()
+
+    def test_snapshot_age_is_measured_in_open_market_bars(self):
+        """A weekend is excused; 13 days is not.
+
+        The snapshot-age gate must use the same open-market bar counting as the
+        engine-lag gate, so Sat/Sun holds do not trip it while a multi-week
+        freeze still does.
+        """
+        friday = datetime(2026, 10, 30, 20, 45)
+        self.assertLessEqual(HC.open_market_bars(friday, SAT_NOON), HC.BAR_TOLERANCE)
+        self.assertGreater(
+            HC.open_market_bars(friday, friday + HC.timedelta(days=13)),
+            HC.BAR_TOLERANCE)
+
+    def test_data_collection_returns_none_rather_than_zero_when_unknown(self):
+        """`--update` must never overwrite a real counter with "0".
+
+        Shallow agent checkouts hold no autosync history, and writing 0 over
+        5239 destroys evidence of how much data was collected.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(HC._data_collection_number(tmp))
+            facts = HC._data_collection_number.__doc__
+            self.assertIn("None", facts)
 
 
 if __name__ == "__main__":

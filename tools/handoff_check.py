@@ -136,7 +136,9 @@ def live_facts(root, spread=None):
     f["as_of_utc"] = as_of_dt.strftime("%Y-%m-%d %H:%M") if as_of_dt else "none"
     f["_as_of_dt"] = as_of_dt
 
-    f["data_collection"] = _data_collection_number(root)
+    counter = _data_collection_number(root)
+    if counter is not None:
+        f["data_collection"] = counter
     return f
 
 
@@ -238,28 +240,63 @@ def open_market_bars(start, end):
 
 
 def engine_lag(root, facts, now=None):
-    """Compare the engine watermark with the newest XM data.
+    """Compare the engine watermark with the newest XM data, and both with now.
 
-    Returns None when either side is missing (e.g. a checkout without xm_data).
+    Two independent failure modes matter, and the earlier version only saw the
+    first:
+
+      * `engine` - the engine stopped consuming bars while the read-only XM
+        logger kept writing `xm_data/`. Caught by comparing the engine
+        watermark with the newest XM candle (`engine_bars`).
+      * `stale` - the *whole* pipeline stopped: no engine bar, no XM candle and
+        no quote for days, so the watermark matches the feed perfectly. The
+        earlier version reported FRESH for 13 days in exactly this case,
+        because a checkout only ever holds frozen files and the comparison was
+        relative to the snapshot in the same frozen files. Caught by comparing
+        the newest evidence with the wall clock (`evidence_bars`).
+
+    Returns None only when there is no evidence at all to compare.
     `bars` counts open-market M15 slots only, so a weekend does not inflate it;
-    `lagging` is True once the engine is ENGINE_LAG_BARS behind the feed.
+    `lagging` is True once either comparison exceeds ENGINE_LAG_BARS;
+    `market_open` decides whether that is a problem (engine_problem()) or
+    merely informational. `stale` says which comparison raised it.
     """
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     feed_dt, feed_src = newest_xm_bar(root)
     mark_dt, mark_src = engine_watermark(facts)
-    if feed_dt is None or mark_dt is None:
+    # Newest evidence is the later of the two: the XM logger and the engine are
+    # independent writers, and either one moving proves the pipeline is alive.
+    evidence_dt = max([d for d in (feed_dt, mark_dt) if d is not None], default=None)
+    if evidence_dt is None:
         return None
-    lag_s = (feed_dt - mark_dt).total_seconds()
-    bars = open_market_bars(mark_dt, feed_dt)
-    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    if mark_dt is not None and feed_dt is not None:
+        engine_bars = open_market_bars(mark_dt, feed_dt)
+    else:
+        engine_bars = 0
+    evidence_bars = open_market_bars(evidence_dt, now)
+    market_open = not _market_quiet(now)
+    if evidence_bars >= ENGINE_LAG_BARS:
+        stale = "stale"
+    elif engine_bars >= ENGINE_LAG_BARS:
+        stale = "engine"
+    else:
+        stale = None
     return {
         "feed_dt": feed_dt,
         "feed_src": feed_src,
         "watermark_dt": mark_dt,
         "watermark_src": mark_src,
-        "lag_s": lag_s,
-        "bars": bars,
-        "lagging": bars >= ENGINE_LAG_BARS,
-        "market_open": not _market_quiet(now),
+        "evidence_dt": evidence_dt,
+        "now": now,
+        "lag_s": (feed_dt - mark_dt).total_seconds() if feed_dt and mark_dt else 0.0,
+        "bars": max(engine_bars, evidence_bars),
+        "engine_bars": engine_bars,
+        "evidence_bars": evidence_bars,
+        # `lagging` stays market-independent (callers test it directly); the
+        # quiet-market exemption lives in engine_problem(), as before.
+        "lagging": stale is not None,
+        "stale": stale,
+        "market_open": market_open,
     }
 
 
@@ -294,6 +331,13 @@ def engine_problem(lag):
     """A human-readable STALE reason, or None when the lag is not a problem."""
     if not lag or not lag["lagging"] or not lag["market_open"]:
         return None
+    if lag.get("stale") == "stale":
+        hours = (lag["now"] - lag["evidence_dt"]).total_seconds() / 3600.0
+        src = lag.get("feed_src") or lag.get("watermark_src") or "the newest file"
+        return (f"no new bar or quote since {lag['evidence_dt']:%Y-%m-%d %H:%M} "
+                f"({lag['evidence_bars']:.0f} open-market M15 bars / {hours:.1f} h ago, "
+                f"newest evidence {src}) - the whole pipeline looks frozen: neither the "
+                "engine nor the XM logger is writing")
     hours = lag["lag_s"] / 3600.0
     return (f"no bar processed since {lag['watermark_dt']:%Y-%m-%d %H:%M} "
             f"({lag['bars']:.0f} open-market M15 bars / {hours:.1f} h behind the newest "
@@ -301,17 +345,30 @@ def engine_problem(lag):
             "bars; check the feed sidecar first")
 
 
-def _data_collection_number(root):
-    try:
-        out = subprocess.run(
-            ["git", "log", "--format=%s", "-n", "50"],
-            cwd=root, capture_output=True, text=True, timeout=20)
+def _data_collection_number(root, depth=500):
+    """Highest autosync "data collection N" commit subject, or None if unknown.
+
+    Returns None (not "0") when git is unavailable, the clone is shallow and
+    holds no data commit, or nothing matches. `--update` then keeps whatever
+    the doc already records: writing 0 over a real counter destroys evidence,
+    and "no data commits in this window" is not the same fact as "counter is
+    zero". Shallow clones are the normal case for agent checkouts.
+    """
+    for args in (["-n", str(depth)], ["--all", "-n", str(depth)]):
+        try:
+            out = subprocess.run(
+                ["git", "log", "--format=%s"] + args,
+                cwd=root, capture_output=True, text=True, timeout=20)
+        except Exception:
+            continue
+        if out.returncode != 0:
+            continue
         nums = [int(m.group(1)) for m in
                 (re.match(r"^data collection (\d+)$", line.strip())
                  for line in out.stdout.splitlines()) if m]
-        return str(max(nums)) if nums else "0"
-    except Exception:
-        return "0"
+        if nums:
+            return str(max(nums))
+    return None
 
 
 def read_block(path):
@@ -485,15 +542,25 @@ def main():
         spread = 0.25
     facts = live_facts(root, spread=spread)
 
-    age_h = None
+    # Two different ages matter and the earlier version conflated them:
+    #   drift_h - how far the snapshot lags the live files (they should match);
+    #   age_h   - how old the newest evidence is relative to the wall clock.
+    # Only age_h can prove the snapshot describes the present. Comparing the
+    # snapshot with the same frozen files it was derived from gave "+0.0 h" and
+    # FRESH for 13 days while the pipeline was dead.
+    drift_h = None
     age_txt = "?"
+    wall_now = datetime.now(timezone.utc).replace(tzinfo=None)
     if facts.get("_as_of_dt") and doc.get("as_of_utc") and doc.get("as_of_utc") != "none":
         try:
             snap = datetime.strptime(doc["as_of_utc"], "%Y-%m-%d %H:%M")
-            age_h = (facts["_as_of_dt"] - snap).total_seconds() / 3600.0
-            age_txt = f"{age_h:+.1f}"
+            drift_h = (facts["_as_of_dt"] - snap).total_seconds() / 3600.0
+            age_h = (wall_now - facts["_as_of_dt"]).total_seconds() / 3600.0
+            age_txt = f"{age_h:.1f} (snapshot vs now); drift {drift_h:+.1f}"
         except ValueError:
-            pass
+            age_h = None
+    else:
+        age_h = None
 
     if update:
         keep = {k: doc[k] for k in doc if k not in facts}
@@ -518,6 +585,9 @@ def main():
             print(f"  [STALE] {problem}")
             print("  the snapshot is in sync with the engine's files, but those files"
                   " are frozen - fix the engine, not the doc")
+            print("  the block was rewritten to match the frozen files (it is honest about"
+                  " what they say) but this is NOT a fresh readiness picture")
+            return 1
         return 0
 
     rows = compare(doc, facts)
@@ -527,12 +597,21 @@ def main():
 
     stale = [r for r in rows if r[3] == "STALE"] + [("doc", "", "", "STALE", p) for p in problems]
     drift = [r for r in rows if r[3] == "DRIFT"]
-    if age_h is not None and age_h > MAX_AGE_HOURS:
-        stale.append(("as_of_utc", doc.get("as_of_utc"), facts["as_of_utc"],
-                      "STALE", f"snapshot is {age_h:.0f} h older than the newest data"))
+    # Open-market bars, not wall clock: a Friday-frozen snapshot is normal on
+    # Sunday, but 13 days is 819 open-market bars and cannot be excused by a
+    # weekend. BAR_TOLERANCE is the same 48 h of M15 bars used for row drift.
+    if age_h is not None and facts.get("_as_of_dt") is not None:
+        age_bars = open_market_bars(facts["_as_of_dt"], wall_now)
+        if age_bars > BAR_TOLERANCE:
+            stale.append(("as_of_utc", doc.get("as_of_utc"), facts["as_of_utc"],
+                          "STALE", f"newest evidence is {age_h:.0f} h / {age_bars} open-market "
+                                   f"bars old (limit {BAR_TOLERANCE} bars) - the snapshot "
+                                   f"cannot describe the present"))
     if lag_problem:
-        stale.append(("engine", f"{lag['watermark_dt']:%m-%d %H:%M}",
-                      f"{lag['feed_dt']:%m-%d %H:%M}", "STALE", lag_problem))
+        def _fmt(dt):
+            return f"{dt:%m-%d %H:%M}" if dt else "none"
+        stale.append(("engine", _fmt(lag["watermark_dt"]),
+                      _fmt(lag["evidence_dt"]), "STALE", lag_problem))
 
     if quiet:
         tail = ""
@@ -550,7 +629,7 @@ def main():
 
     print(f"handoff_check - docs/HANDOFF.md vs live data in {root}")
     print(f"  snapshot as_of {doc.get('as_of_utc', '?')} | newest data "
-          f"{facts['as_of_utc']} | age {age_txt} h")
+          f"{facts['as_of_utc']} | wall age {age_txt} h")
     print()
     print(f"  {'key':24s} {'doc':>14s} {'live':>14s}  verdict")
     for k, d, live, verdict, note in rows:
@@ -559,10 +638,17 @@ def main():
               + (f"  {note}" if note else ""))
     if lag:
         mark = "STALE]" if lag_problem else "  ok ]"
+        feed_txt = (lag["feed_dt"].strftime("%Y-%m-%d %H:%M")
+                    if lag["feed_dt"] else "None")
+        mark_txt = (lag["watermark_dt"].strftime("%Y-%m-%d %H:%M")
+                    if lag["watermark_dt"] else "None")
         print("\n== engine vs XM feed (is the forward test still moving?) ==")
-        print(f"  newest XM data   {lag['feed_dt']:%Y-%m-%d %H:%M} ({lag['feed_src']})")
-        print(f"  engine watermark {lag['watermark_dt']:%Y-%m-%d %H:%M} ({lag['watermark_src']})")
-        print(f"  lag              {lag['bars']:.0f} open-market M15 bars"
+        print(f"  newest XM data   {feed_txt} ({lag['feed_src'] or 'no xm_data'})")
+        print(f"  engine watermark {mark_txt} ({lag['watermark_src'] or 'no engine files'})")
+        print(f"  newest evidence  {lag['evidence_dt']:%Y-%m-%d %H:%M}"
+              f" ({lag['evidence_bars']:.0f} open-market M15 bars / "
+              f"{(lag['now'] - lag['evidence_dt']).total_seconds() / 3600:+.1f} h ago)")
+        print(f"  engine lag       {lag['engine_bars']:.0f} open-market M15 bars"
               f" ({lag['lag_s'] / 3600:+.1f} h)  [{mark}"
               + ("" if lag["market_open"] else "  market quiet - informational"))
         if lag_problem:
@@ -571,6 +657,8 @@ def main():
                   " are the only evidence it was read")
             print("  triage: python3 tools/feed_doctor.py; systemctl status mt5feed-nasdaq"
                   " nasdaq-engine; journalctl -u mt5feed-nasdaq -n 100")
+        elif not lag["lagging"]:
+            print("  both the engine and the XM logger are moving (or the market is quiet)")
     if problems:
         print("\n== doc self-consistency ==")
         for p in problems:
@@ -579,9 +667,10 @@ def main():
     if stale:
         print(f"== result: HANDOFF STALE ({len(stale)} problem(s), "
               f"{len(drift)} advisory) ==")
-        if lag_problem and all(s[0] == "engine" for s in stale):
-            print("Fix: the doc already matches the data - the engine is not getting bars."
-                  " Diagnose the feed sidecar (docs/STALE-FEED-TRIAGE.md §5), not the doc.")
+        if lag_problem:
+            print("Fix: do NOT just run --update. The doc already matches the data; the "
+                  "pipeline stopped moving. Diagnose the feed/engine first "
+                  "(docs/STALE-FEED-TRIAGE.md §5); --update would only re-stamp stale numbers.")
         else:
             print("Fix: python3 tools/handoff_check.py --update   (snapshot block)")
         return 1
