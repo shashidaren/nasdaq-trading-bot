@@ -64,7 +64,8 @@ SEED_FILES = {
     # the REAL doctor against the fixture's feed files.
     ".gitignore": ("__pycache__/\n*.py[cod]\n"
                    "mt5_last_candle.json\nmt5_feed_health.json\n"
-                   "mt5_warmup_candles.json\nmt5_feed_offset.json\njournal.csv\n"),
+                   "mt5_warmup_candles.json\nmt5_feed_offset.json\n"
+                   "autosync_heartbeat.json\n*.tmp-*\njournal.csv\n"),
     "tools/smoke_test.py": STUB_SMOKE,
     "tools/check_data.py": STUB_CHECK,
     "trades.csv": "Trade_Num,Trade_Type,Entry_Time\n1,BUY,2026-10-30 04:00:00\n",
@@ -488,6 +489,64 @@ class AutosyncTests(unittest.TestCase):
         self.assertIn("feed service NOT FOUND - restart feed sidecar manually", out)
         self.assertFalse(any(c.startswith("restart ") for c in self.systemctl_calls()),
                          "without a detected unit autosync must not guess a restart target")
+
+    def test_flowing_feed_with_reconnect_churn_logs_advisory_without_stale_or_restart(self):
+        now = int(time.time())
+        self.write(self.work, "mt5_last_candle.json", json.dumps({
+            "symbol": "US100Cash", "timeframe": "M15", "account": "1",
+            "ts": now - (15 * 60 + 2 * 60), "server_offset_s": 7200,
+            "open": 20000.0, "high": 20010.0, "low": 19990.0,
+            "close": 20005.0, "tick_volume": 100}))
+        self.write(self.work, "mt5_feed_health.json", json.dumps({
+            "status": "OK", "symbol": "US100Cash", "timeframe": "M15",
+            "account": "1", "server_offset_s": 7200, "tick_age_s": 1.0,
+            "reconnects": 9, "uptime_s": 7 * 3600, "last_error": None}))
+        proc = self.run_autosync()
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out[-1500:])
+        self.assertIn("feed: OK/- -> OK (reconnect churn advisory: 1.29/h)", out)
+        self.assertNotIn("STALE", out)
+        self.assertFalse(any(c.startswith("restart ") for c in self.systemctl_calls()))
+        self.assert_repo_healthy()
+
+    def test_heartbeat_stamp_written_each_run_and_stays_gitignored(self):
+        before = time.time() - 2
+        proc = self.run_autosync()
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out[-1500:])
+        hb_path = self.work / "autosync_heartbeat.json"
+        self.assertTrue(hb_path.is_file(), "default heartbeat stamp must be written in NASDAQ_DIR")
+        hb = json.loads(hb_path.read_text(encoding="utf-8"))
+        self.assertEqual(hb["status"], "ok")
+        self.assertEqual(hb["exit_code"], 0)
+        self.assertEqual(hb["phase"], "done")
+        self.assertEqual(hb["push"], "ok")
+        self.assertEqual(hb["notify"], "off")
+        self.assertGreaterEqual(hb["ts_epoch"], before)
+        self.assertRegex(hb["ts_utc"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        self.assert_repo_healthy()
+        self.assertNotIn("autosync_heartbeat.json", self.git(self.work, "ls-files"))
+
+        # Custom HEARTBEAT_FILE on a warning run (check_data exits 1) records status='warn'.
+        custom_hb = Path(self.tmp.name) / "custom_hb.json"
+        self.write(self.work, "tools/check_data.py",
+                   "import sys; print('== result: 1 fail, 0 warn =='); sys.exit(1)\n")
+        self.git(self.work, "commit", "-am", "stub check fail", "-q")
+        proc_warn = self.run_autosync(HEARTBEAT_FILE=str(custom_hb))
+        self.assertEqual(proc_warn.returncode, 0)
+        hb_warn = json.loads(custom_hb.read_text(encoding="utf-8"))
+        self.assertEqual(hb_warn["status"], "warn")
+        self.assertEqual(hb_warn["exit_code"], 0)
+        self.assertIn("1 fail", hb_warn["check"])
+
+        # Early failure (mid-merge sentinel) records status='error' and non-zero exit_code.
+        (self.work / ".git" / "MERGE_HEAD").write_text("0" * 40 + "\n", encoding="utf-8")
+        proc_err = self.run_autosync(HEARTBEAT_FILE=str(custom_hb))
+        self.assertNotEqual(proc_err.returncode, 0)
+        hb_err = json.loads(custom_hb.read_text(encoding="utf-8"))
+        self.assertEqual(hb_err["status"], "error")
+        self.assertEqual(hb_err["exit_code"], proc_err.returncode)
+        self.assertEqual(hb_err["phase"], "preflight")
 
 
 if __name__ == "__main__":

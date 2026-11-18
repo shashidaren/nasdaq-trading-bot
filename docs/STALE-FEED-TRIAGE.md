@@ -9,7 +9,7 @@ python3 tools/feed_doctor.py --json                       # machine-readable
 python3 tools/feed_doctor.py --assume-open                # triage outside CME hours
 ```
 
-Exit codes: `0` feed healthy (or market closed), `1` feed stale while open,
+Exit codes: `0` feed flowing (`OK`, with or without reconnect-churn advisory) or market closed (`QUIET`), `1` feed genuinely stale while open (`STALE`),
 `2` feed broken (missing / unreadable / wrong schema / foreign symbol).
 
 ---
@@ -51,13 +51,17 @@ journalctl -u mt5feed-nasdaq -n 80 --no-pager
 systemctl show mt5feed-nasdaq -p Environment
 ```
 
-`feed_doctor` also gates on reconnect churn, not just instantaneous candle/heartbeat state:
-at least two reconnects over a sidecar uptime window of 15 minutes or more, at a rate above
-1 reconnect/hour, changes the verdict to `STALE` even if the latest bar is fresh. The JSON
-`reconnect_churn` object reports count, uptime, rate, and threshold. The rate window is the
-current sidecar process lifetime (counter resets on restart); isolated startup reconnects are
-filtered out. Churn alone does not authorize an automatic restart—the existing dead-handle/
-not-running safety rules still apply.
+`feed_doctor` also tracks reconnect churn separately from real feed staleness: at least two
+reconnects over a sidecar uptime window of 15 minutes or more, at a rate above
+`1.00` reconnect/hour, raises a standalone reconnect-churn advisory (`reconnect_churn.elevated`
+and `reconnect_churn.advisory`, also listed in top-level `advisories` and printed as an
+`advisory :` line). When bars are still arriving fresh, the verdict stays `OK` (exit `0`) with
+headline `feed flowing (reconnect churn advisory: X.XX/h > 1.00/h)` instead of crying `STALE`
+over a 2-minute-old candle; `STALE` (exit `1`) is reserved for genuinely stale feeds and
+`BROKEN` (exit `2`) for structural faults, with the churn advisory included alongside the
+primary diagnosis when both apply. The rate window is the current sidecar process lifetime
+(counter resets on restart); isolated startup reconnects are filtered out. Churn never
+authorizes an automatic restart—the existing dead-handle/not-running safety rules still apply.
 
 | `mt5_feed_health.json` → `status` | Cause | Fix |
 |---|---|---|

@@ -27,6 +27,7 @@ mt5_last_candle.json
 mt5_warmup_candles.json
 mt5_feed_health.json
 mt5_feed_offset.json
+autosync_heartbeat.json
 mt5_bridge/
 HALT
 MT5_ORDER_HALT

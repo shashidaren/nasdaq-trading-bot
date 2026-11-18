@@ -13,6 +13,7 @@ Deployed on /opt/nasdaq to trade XM's US100Cash on 15-minute (M15) bars:
       2) Linux -> Wine atomic JSON bridge (/opt/nasdaq/mt5_bridge via tools/mt5_executor.py)
 """
 import csv
+import io
 import json
 import math
 import os
@@ -135,6 +136,9 @@ def migrate_trades_csv(path: str = None) -> bool:
     if not os.path.isfile(path):
         return False
     try:
+        with open(path, "rb") as raw_fh:
+            if b"\x00" in raw_fh.read():
+                return False
         with open(path, newline="") as f:
             raw = [r for r in csv.reader(f) if r]
     except Exception as e:
@@ -173,6 +177,82 @@ def migrate_trades_csv(path: str = None) -> bool:
     print(f"WARNING: migrated {path} to 16-field schema "
           f"({len(raw) - 1} rows rewritten, {odd} odd). Backup: {backup}.")
     return True
+
+
+def _parse_trade_num(value):
+    """Parse a strictly positive integer Trade_Num, or return None."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        num = int(text)
+    except ValueError:
+        return None
+    return num if num >= 1 else None
+
+
+def _max_closed_trade_num(path: str = None) -> int:
+    """Return the highest closed Trade_Num in trades.csv (0 when absent/empty)."""
+    path = TRADES_LOG_PATH if path is None else path
+    if not path or not os.path.isfile(path):
+        return 0
+    max_num = 0
+    try:
+        with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+            for row in csv.DictReader(fh):
+                raw_num = row.get("Trade_Num")
+                if raw_num is None:
+                    for k, v in row.items():
+                        if k and k.strip() == "Trade_Num":
+                            raw_num = v
+                            break
+                num = _parse_trade_num(raw_num)
+                if num is not None and num > max_num:
+                    max_num = num
+    except (OSError, csv.Error):
+        return 0
+    return max_num
+
+
+def _read_closed_trade_nums(path: str = None) -> set:
+    """Strictly read all Trade_Num integers currently recorded in trades.csv.
+
+    Raises on NUL padding, missing header, or any row with a missing/invalid
+    Trade_Num so log_trade() fails closed rather than guessing uniqueness.
+    """
+    path = TRADES_LOG_PATH if path is None else path
+    if not path or not os.path.isfile(path):
+        return set()
+    with open(path, "rb") as raw_fh:
+        data = raw_fh.read()
+    if b"\x00" in data:
+        raise ValueError(f"{path} contains NUL byte(s)")
+    text = data.decode("utf-8")
+    if not text.strip():
+        return set()
+    with io.StringIO(text, newline="") as fh:
+        reader = csv.reader(fh)
+        header = next(reader, None)
+        if not header:
+            return set()
+        norm_header = [h.strip() for h in header]
+        if "Trade_Num" not in norm_header:
+            raise ValueError(f"{path} header missing Trade_Num")
+        num_idx = norm_header.index("Trade_Num")
+        nums = set()
+        for lineno, row in enumerate(reader, start=2):
+            if not row or not any(cell.strip() for cell in row):
+                continue
+            raw_val = row[num_idx] if num_idx < len(row) else ""
+            num = _parse_trade_num(raw_val)
+            if num is None:
+                raise ValueError(f"{path} line {lineno} has invalid Trade_Num {raw_val!r}")
+            nums.add(num)
+    return nums
 
 
 def utc_now_str() -> str:
@@ -376,6 +456,8 @@ class NasdaqEngine:
 
         self.load_trade_stats()
         self.restore_open_trade_from_status()
+        if self.current_trade_num is not None:
+            self._advance_next_trade_num_past(self.current_trade_num)
 
         if TRADING_MODE == "LIVE":
             if mt5 is not None:
@@ -456,14 +538,49 @@ class NasdaqEngine:
                     self.balance = last_balance
 
             closed = self.wins + self.losses
+            if os.path.isfile(STATUS_FILE_PATH):
+                try:
+                    with open(STATUS_FILE_PATH) as sf:
+                        st = json.load(sf)
+                    if isinstance(st, dict) and st.get("total_trades") == closed:
+                        saved_next = _parse_trade_num(st.get("next_trade_num"))
+                        if saved_next is not None and saved_next > self.next_trade_num:
+                            self.next_trade_num = saved_next
+                except Exception:
+                    pass
             print(f"Loaded trade stats -> next_trade=#{self.next_trade_num} | "
                   f"closed={closed} ({self.wins}W/{self.losses}L) | balance=${self.balance:.2f}")
         except Exception as e:
             print(f"Failed to load trade stats: {e}")
-            self.next_trade_num = 1
+            self.next_trade_num = _max_closed_trade_num(TRADES_LOG_PATH) + 1
             self.wins = 0
             self.losses = 0
             self.balance = STARTING_BALANCE
+
+    def _peek_next_trade_num(self) -> int:
+        """Return max(next_trade_num, max_closed_in_trades_csv + 1) without mutating state."""
+        cur_next = _parse_trade_num(self.next_trade_num) or 1
+        ledger_next = _max_closed_trade_num(TRADES_LOG_PATH) + 1
+        return max(1, cur_next, ledger_next)
+
+    def _allocate_trade_num(self) -> int:
+        """Allocate a unique, strictly increasing Trade_Num and advance next_trade_num.
+
+        Used by every entry, restore fallback, and broker-reconciliation path.
+        Guarantees the returned number is >= max(next_trade_num, max_closed + 1)
+        and advances next_trade_num immediately so restarts/closes never reuse it.
+        """
+        num = self._peek_next_trade_num()
+        self.next_trade_num = num + 1
+        return num
+
+    def _advance_next_trade_num_past(self, trade_num=None) -> None:
+        """Force next_trade_num >= max(next_trade_num, trade_num + 1, max_closed + 1)."""
+        floor = self._peek_next_trade_num()
+        parsed = _parse_trade_num(trade_num)
+        if parsed is not None:
+            floor = max(floor, parsed + 1)
+        self.next_trade_num = max(1, floor)
 
     def restore_open_trade_from_status(self):
         """Restore open trade metadata from status.json after crash/restart."""
@@ -491,9 +608,15 @@ class NasdaqEngine:
         self.stop_loss = float(sl)
         self.take_profit = float(tp)
         self.entry_time = data.get("entry_time") or utc_now_str()
-        self.current_trade_num = data.get("current_trade_num")
-        if self.current_trade_num is None:
-            self.current_trade_num = max(1, self.next_trade_num - 1)
+        saved_next = _parse_trade_num(data.get("next_trade_num"))
+        if saved_next is not None:
+            self.next_trade_num = max(self._peek_next_trade_num(), saved_next)
+        saved_num = _parse_trade_num(data.get("current_trade_num"))
+        if saved_num is not None:
+            self.current_trade_num = saved_num
+            self._advance_next_trade_num_past(self.current_trade_num)
+        else:
+            self.current_trade_num = self._allocate_trade_num()
         self.entry_rsi = data.get("entry_rsi")
         self.entry_atr = data.get("entry_atr")
         self.entry_wick_ratio = data.get("entry_wick_ratio")
@@ -509,7 +632,8 @@ class NasdaqEngine:
         else:
             self.trade_active = True
 
-        print(f"Restored OPEN {self.trade_type} trade #{self.current_trade_num} | "
+        print(f"Restored OPEN {self.trade_type} trade #{self.current_trade_num} "
+              f"(next_trade=#{self.next_trade_num}) | "
               f"Entry=${self.entry_price:,.2f} SL=${self.stop_loss:,.2f} TP=${self.take_profit:,.2f}")
 
     def _live_magic_positions(self) -> list:
@@ -574,8 +698,9 @@ class NasdaqEngine:
                 self.take_profit = tp
             self.entry_time = ts
             if self.current_trade_num is None:
-                self.current_trade_num = self.next_trade_num
-                self.next_trade_num += 1
+                self.current_trade_num = self._allocate_trade_num()
+            else:
+                self._advance_next_trade_num_past(self.current_trade_num)
             return
 
         if self.trade_active_live:
@@ -955,17 +1080,79 @@ class NasdaqEngine:
                 "ATR": f"{atr_val:.2f}" if atr_val else "Calculating",
             })
 
-    def log_trade(self, exit_price, exit_reason, profit, exit_time=None):
+    def log_trade(self, exit_price, exit_reason, profit, exit_time=None, balance_after=None) -> bool:
+        """Append a closed trade row to trades.csv if and only if Trade_Num is unique and strictly increasing.
+
+        Refuses duplicate, non-increasing, invalid, or unverifiable Trade_Num values (journals a
+        loud error and leaves trades.csv untouched). Never rewrites history. Always forces
+        next_trade_num >= max(next_trade_num, current_trade_num + 1, max_closed + 1).
+        """
+        trade_num = _parse_trade_num(self.current_trade_num)
+        if trade_num is None:
+            self._advance_next_trade_num_past(None)
+            msg = (
+                f"ERROR: REFUSED to append closed trade ({self.trade_type} {exit_reason} "
+                f"@ {exit_price:,.2f}, profit={profit:+.2f}): invalid Trade_Num="
+                f"{self.current_trade_num!r}; row skipped, ledger untouched, "
+                f"next_trade_num={self.next_trade_num}"
+            )
+            print(msg, flush=True)
+            self.journal("TRADE_NUM_ERROR", msg)
+            return False
+
         file_exists = os.path.isfile(TRADES_LOG_PATH)
         if file_exists:
             migrate_trades_csv(TRADES_LOG_PATH)
+            try:
+                existing_nums = _read_closed_trade_nums(TRADES_LOG_PATH)
+            except (OSError, csv.Error, UnicodeError, ValueError) as exc:
+                self._advance_next_trade_num_past(trade_num)
+                msg = (
+                    f"ERROR: REFUSED to append Trade_Num #{trade_num} "
+                    f"({self.trade_type} {exit_reason} @ {exit_price:,.2f}): "
+                    f"could not verify {TRADES_LOG_PATH} uniqueness ({exc}); "
+                    f"row skipped, ledger untouched, next_trade_num={self.next_trade_num}"
+                )
+                print(msg, flush=True)
+                self.journal("TRADE_NUM_ERROR", msg)
+                return False
+
+            if trade_num in existing_nums:
+                self._advance_next_trade_num_past(max(existing_nums | {trade_num}))
+                msg = (
+                    f"ERROR: REFUSED duplicate Trade_Num #{trade_num} in {TRADES_LOG_PATH} "
+                    f"({self.trade_type} entry={self.entry_time} {exit_reason} @ {exit_price:,.2f}, "
+                    f"profit={profit:+.2f}); row skipped, ledger untouched, "
+                    f"next_trade_num={self.next_trade_num}"
+                )
+                print(msg, flush=True)
+                self.journal("TRADE_NUM_DUPLICATE", msg)
+                return False
+
+            max_existing = max(existing_nums) if existing_nums else 0
+            if trade_num <= max_existing:
+                self._advance_next_trade_num_past(max_existing)
+                msg = (
+                    f"ERROR: REFUSED non-increasing Trade_Num #{trade_num} <= max closed "
+                    f"#{max_existing} in {TRADES_LOG_PATH} ({self.trade_type} "
+                    f"entry={self.entry_time} {exit_reason} @ {exit_price:,.2f}, "
+                    f"profit={profit:+.2f}); row skipped, ledger untouched, "
+                    f"next_trade_num={self.next_trade_num}"
+                )
+                print(msg, flush=True)
+                self.journal("TRADE_NUM_ORDER_ERROR", msg)
+                return False
+
+            ensure_appendable_log(TRADES_LOG_PATH)
+
+        bal = self.balance if balance_after is None else float(balance_after)
         os.makedirs(os.path.dirname(TRADES_LOG_PATH) or ".", exist_ok=True)
         with open(TRADES_LOG_PATH, mode="a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=TRADES_FIELDNAMES)
             if not file_exists:
                 writer.writeheader()
             writer.writerow({
-                "Trade_Num": self.current_trade_num,
+                "Trade_Num": trade_num,
                 "Trade_Type": self.trade_type,
                 "Entry_Time": self.entry_time,
                 "Exit_Time": exit_time or utc_now_str(),
@@ -975,13 +1162,16 @@ class NasdaqEngine:
                 "Exit_Price": f"{exit_price:.2f}",
                 "Exit_Reason": exit_reason,
                 "Profit": f"{profit:.2f}",
-                "Balance_After": f"{self.balance:.2f}",
+                "Balance_After": f"{bal:.2f}",
                 "RSI_At_Entry": f"{self.entry_rsi:.1f}" if self.entry_rsi is not None else "",
                 "ATR_At_Entry": f"{self.entry_atr:.2f}" if self.entry_atr is not None else "",
                 "Wick_Ratio_At_Entry": f"{self.entry_wick_ratio:.1%}" if self.entry_wick_ratio is not None else "",
                 "EMA50_At_Entry": f"{self.entry_ema_fast:.2f}" if self.entry_ema_fast is not None else "",
                 "EMA200_At_Entry": f"{self.entry_ema_slow:.2f}" if self.entry_ema_slow is not None else "",
             })
+        self.current_trade_num = trade_num
+        self._advance_next_trade_num_past(trade_num)
+        return True
 
     def close_simulated_trade(self, exit_price: float, exit_reason: str) -> bool:
         """Finalize one simulated exit and write the ledger/status exactly once."""
@@ -995,19 +1185,33 @@ class NasdaqEngine:
         else:
             profit = (self.entry_price - exit_price) * LOT_SIZE * CONTRACT_SIZE
 
-        self.balance += profit
+        new_balance = self.balance + profit
+        closed_num = self.current_trade_num
+        self.trade_active = False
+        logged = self.log_trade(
+            exit_price=exit_price,
+            exit_reason=exit_reason,
+            profit=profit,
+            balance_after=new_balance,
+        )
+        self._advance_next_trade_num_past(closed_num)
+        if not logged:
+            self.current_trade_num = None
+            self.save_status()
+            return False
+
+        recorded_num = self.current_trade_num
+        self.current_trade_num = None
+        self.balance = new_balance
         if exit_reason == "TP":
             self.wins += 1
         else:
             self.losses += 1
 
-        self.trade_active = False
-        self.log_trade(exit_price=exit_price, exit_reason=exit_reason, profit=profit)
-
         pnl_text = f"+${profit:,.2f}" if profit >= 0 else f"-${abs(profit):,.2f}"
         self.journal(
             "TRADE_EXIT",
-            f"{exit_reason} HIT ({self.trade_type} #{self.current_trade_num}) | "
+            f"{exit_reason} HIT ({self.trade_type} #{recorded_num}) | "
             f"Exit: {exit_price:,.2f} ({pnl_text}) | Equity: ${self.balance:,.2f}",
         )
         self.save_status()
@@ -1278,7 +1482,7 @@ class NasdaqEngine:
             "sl_dist": round(sl_dist, 4),
             "tp_dist": round(tp_dist, 4),
             "magic": MAGIC_NUMBER,
-            "trade_num": self.next_trade_num,
+            "trade_num": self._peek_next_trade_num(),
             "comment": f"Nasdaq Live {direction}",
         }
         intent_path = os.path.join(MT5_ORDER_DIR, "intent.json")
@@ -1312,8 +1516,7 @@ class NasdaqEngine:
 
         pos_id = int(res.get("position_id") or res.get("order") or 0)
         fill_px = float(res.get("fill_price") or c)
-        self.current_trade_num = self.next_trade_num
-        self.next_trade_num += 1
+        self.current_trade_num = self._allocate_trade_num()
         self.active_ticket = pos_id
         self.active_position_id = pos_id
         self.trade_active = False
@@ -1423,8 +1626,7 @@ class NasdaqEngine:
             after_pos = self._live_magic_positions()
             if after_pos:
                 pid = int(getattr(after_pos[0], "ticket", 0) or 0)
-                self.current_trade_num = self.next_trade_num
-                self.next_trade_num += 1
+                self.current_trade_num = self._allocate_trade_num()
                 self.active_ticket = pid
                 self.active_position_id = pid
                 self.trade_active_live = True
@@ -1455,8 +1657,7 @@ class NasdaqEngine:
             pos_id = int(getattr(after_pos[-1], "ticket", pos_id) or pos_id)
             fill_px = float(getattr(after_pos[-1], "price_open", fill_px) or fill_px)
 
-        self.current_trade_num = self.next_trade_num
-        self.next_trade_num += 1
+        self.current_trade_num = self._allocate_trade_num()
         self.active_ticket = pos_id
         self.active_position_id = pos_id
         self.trade_active = False
@@ -1483,8 +1684,7 @@ class NasdaqEngine:
     def execute_simulated_trade(self, direction: str, c: float, wick_ratio: float, ts: str):
         self.trade_active = True
         self.trade_type = direction
-        self.current_trade_num = self.next_trade_num
-        self.next_trade_num += 1
+        self.current_trade_num = self._allocate_trade_num()
 
         self.entry_price = c
         if direction == "BUY":
@@ -1526,30 +1726,46 @@ class NasdaqEngine:
             elif price >= self.stop_loss:
                 self.close_simulated_trade(exit_price=price, exit_reason="SL")
 
-    def _record_live_exit(self, exit_price: float, net_profit: float, exit_time: str = None, broker_balance: float = None):
+    def _record_live_exit(self, exit_price: float, net_profit: float, exit_time: str = None, broker_balance: float = None) -> bool:
         reason = "TP" if net_profit > 0 else "SL"
-        if net_profit > 0:
-            self.wins += 1
-        else:
-            self.losses += 1
-
         if broker_balance is not None and broker_balance > 0:
-            self.balance = float(broker_balance)
+            new_balance = float(broker_balance)
         else:
-            self.balance += net_profit
+            new_balance = self.balance + net_profit
 
+        closed_num = self.current_trade_num
         self.trade_active = False
         self.trade_active_live = False
         self.active_ticket = None
         self.active_position_id = None
 
-        self.log_trade(exit_price=exit_price, exit_reason=reason, profit=net_profit, exit_time=exit_time)
+        logged = self.log_trade(
+            exit_price=exit_price,
+            exit_reason=reason,
+            profit=net_profit,
+            exit_time=exit_time,
+            balance_after=new_balance,
+        )
+        self._advance_next_trade_num_past(closed_num)
+        if not logged:
+            self.current_trade_num = None
+            self.save_status()
+            return False
+
+        recorded_num = self.current_trade_num
+        self.current_trade_num = None
+        if net_profit > 0:
+            self.wins += 1
+        else:
+            self.losses += 1
+        self.balance = new_balance
         self.journal(
             "LIVE_EXIT",
-            f"{reason} HIT ({self.trade_type} #{self.current_trade_num}) | "
+            f"{reason} HIT ({self.trade_type} #{recorded_num}) | "
             f"Exit: {exit_price:,.2f} | Net Profit: ${net_profit:,.2f} | Balance: ${self.balance:,.2f}",
         )
         self.save_status()
+        return True
 
     def check_live_exits(self):
         """Reconcile broker-side SL/TP/manual exits by position_id (not entry order ticket)."""
@@ -1591,6 +1807,10 @@ class NasdaqEngine:
             pid = int(getattr(open_pos[0], "ticket", 0) or 0)
             self.active_ticket = pid
             self.active_position_id = pid
+            if self.current_trade_num is None:
+                self.current_trade_num = self._allocate_trade_num()
+            else:
+                self._advance_next_trade_num_past(self.current_trade_num)
             return
 
         deals = ()

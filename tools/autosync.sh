@@ -65,6 +65,7 @@ FEED_HEAL_WAIT_S="${FEED_HEAL_WAIT_S:-20}"
 NOTIFY="${NOTIFY:-off}"
 DAILY_STAMP="${DAILY_STAMP:-/tmp/nasdaq_autosync_daily_digest}"
 ALERT_STAMP="${ALERT_STAMP:-/tmp/nasdaq_autosync_last_alert}"
+HEARTBEAT_FILE="${HEARTBEAT_FILE:-$NASDAQ_DIR/autosync_heartbeat.json}"
 DATA_FILES=(trades.csv forward_test_log.csv skipped_trades.csv status.json xm_data)
 CODE_PATHS=(engine.py trade_filter.py dashboard.py pressure.py feed_health.py tools/)
 
@@ -364,19 +365,81 @@ rollback_deploy() {
 }
 
 feed_doctor_line() {
-    # "<VERDICT>\t<RESTART_ACTION>" from tools/feed_doctor.py --json, or
-    # "ERROR\t-" if the doctor cannot run. The doctor exits 1/2 for
-    # STALE/BROKEN on purpose, so its rc is never used as a gate here.
+    # "<VERDICT>\t<RESTART_ACTION>\t<CHURN_ADVISORY>" from tools/feed_doctor.py
+    # --json, or "ERROR\t-\t-" if the doctor cannot run. The doctor exits 1/2
+    # for STALE/BROKEN on purpose, so its rc is never used as a gate here.
     python3 tools/feed_doctor.py --data-dir "$NASDAQ_DIR" --json 2>/dev/null \
         | python3 -c '
 import json, sys
 try:
     r = json.load(sys.stdin)
-    print("{}\t{}".format((r.get("verdict") or ["UNKNOWN"])[0],
-                          (r.get("actions") or {}).get("restart_sidecar") or "-"))
+    churn = r.get("reconnect_churn") or {}
+    churn_tag = (
+        "{:.2f}/h".format(churn["rate_per_hour"])
+        if churn.get("elevated") and churn.get("rate_per_hour") is not None
+        else "-"
+    )
+    print("{}\t{}\t{}".format(
+        (r.get("verdict") or ["UNKNOWN"])[0],
+        (r.get("actions") or {}).get("restart_sidecar") or "-",
+        churn_tag,
+    ))
 except Exception:
-    print("ERROR\t-")
+    print("ERROR\t-\t-")
 ' 2>/dev/null | tail -n 1 || true
+}
+
+HEARTBEAT_PHASE="preflight"
+write_heartbeat() {
+    # Atomic runtime stamp read by dashboard.py /readiness (STALE > 45 min).
+    # Gitignored so writing it never dirties the worktree or causes merge conflicts.
+    local rc="${1:-0}" status="ok"
+    [ -z "$HEARTBEAT_FILE" ] && return 0
+    if [ "$rc" -ne 0 ]; then
+        status="error"
+    elif [ "${PUSH_MSG:-}" != "ok" ] || [ "${CHECK_RC:-0}" != "0" ]; then
+        status="warn"
+    else
+        case "${DEPLOY_MSG:-none}" in
+            none|deployed*)
+                case "${DEPLOY_MSG:-none}" in
+                    *FAILED*|*STALE*|*NOT\ ACTIVE*|*NOT\ FOUND*|*GIT\ ERROR*|*ABORTED*)
+                        status="warn" ;;
+                esac ;;
+            *) status="warn" ;;
+        esac
+    fi
+    HB_STATUS="$status" HB_RC="$rc" HB_PHASE="${HEARTBEAT_PHASE:-done}" \
+    HB_DATA="${DATA_MSG:-not run}" HB_PUSH="${PUSH_MSG:-not run}" \
+    HB_DEPLOY="${DEPLOY_MSG:-none}" HB_FEED="${FEED_MSG:-not run}" \
+    HB_CHECK="${CHECK_MSG:-not run}" HB_NOTIFY="${NOTIFY:-off}" \
+    python3 - "$HEARTBEAT_FILE" <<'PYEOF' >/dev/null 2>&1 || true
+import datetime, json, os, sys
+path = sys.argv[1]
+now = datetime.datetime.now(datetime.timezone.utc)
+payload = {
+    "ts_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
+    "ts_epoch": round(now.timestamp(), 3),
+    "status": os.environ.get("HB_STATUS", "ok"),
+    "exit_code": int(os.environ.get("HB_RC", "0")),
+    "phase": os.environ.get("HB_PHASE", "done"),
+    "data": os.environ.get("HB_DATA", ""),
+    "push": os.environ.get("HB_PUSH", ""),
+    "deploy": os.environ.get("HB_DEPLOY", ""),
+    "feed": os.environ.get("HB_FEED", ""),
+    "check": os.environ.get("HB_CHECK", "").removesuffix(" ==").strip(),
+    "notify": os.environ.get("HB_NOTIFY", ""),
+}
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+tmp = f"{path}.tmp-{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, indent=2)
+    fh.write("\n")
+    fh.flush()
+os.replace(tmp, path)
+PYEOF
 }
 
 # --- lock ---------------------------------------------------------------------
@@ -384,6 +447,7 @@ exec 9>"$LOCK_FILE" || { log "FATAL: cannot open lock file"; exit 1; }
 if ! flock -n 9; then log "another autosync run is active - skipping"; exit 0; fi
 
 cd "$NASDAQ_DIR" || { log "FATAL: cannot cd to $NASDAQ_DIR"; alert_once "fatal-cd|$NASDAQ_DIR" "nasdaq autosync: FATAL - cannot cd to $NASDAQ_DIR"; exit 1; }
+trap 'write_heartbeat $?' EXIT
 
 # Cheap fail-closed preflight: Git can misleadingly return an empty status and
 # a successful "no diff" result when its object database is damaged. Never
@@ -416,6 +480,7 @@ DEPLOY_FATAL=0
 EXTRA=""
 
 # --- phase 1: commit live data -------------------------------------------------
+HEARTBEAT_PHASE="commit"
 if commit_live_data; then
     DATA_MSG="$DATA_COMMIT_NOTE"
     [ "$DATA_MSG" = "no new data" ] && log "no data changes"
@@ -428,6 +493,7 @@ if [ "$GIT_STATE_FATAL" = "1" ]; then
 fi
 
 # --- phase 2: fetch & (maybe) deploy ------------------------------------------
+HEARTBEAT_PHASE="deploy"
 git fetch "$REMOTE" "$BRANCH" >/dev/null 2>&1 || log "WARN: git fetch failed (offline/credentials?)"
 
 LOCAL_SHA=$(git rev-parse --verify HEAD 2>/dev/null)
@@ -646,6 +712,7 @@ case "$DEPLOY_MSG" in
 esac
 
 # --- phase 3: push -------------------------------------------------------------
+HEARTBEAT_PHASE="push"
 PUSH_MSG="ok"
 if [ "$GIT_STATE_FATAL" = "1" ]; then
     PUSH_MSG="SKIPPED - Git state was not trustworthy; manual intervention required"
@@ -674,12 +741,18 @@ else
     FEED_LINE=$(feed_doctor_line)
     FEED_LEVEL=""
     FEED_ACTION="-"
+    FEED_CHURN="-"
     if [ -n "$FEED_LINE" ]; then
-        IFS=$'\t' read -r FEED_LEVEL FEED_ACTION <<< "$FEED_LINE"
+        IFS=$'\t' read -r FEED_LEVEL FEED_ACTION FEED_CHURN <<< "$FEED_LINE"
+        [ -z "${FEED_CHURN:-}" ] && FEED_CHURN="-"
     fi
     case "$FEED_LEVEL" in
         OK|QUIET)
-            FEED_MSG="$FEED_LEVEL" ;;
+            if [ "$FEED_CHURN" != "-" ]; then
+                FEED_MSG="$FEED_LEVEL (reconnect churn advisory: $FEED_CHURN)"
+            else
+                FEED_MSG="$FEED_LEVEL"
+            fi ;;
         STALE|BROKEN)
             if [ -z "$FEED_ACTION" ] || [ "$FEED_ACTION" = "-" ]; then
                 # Unhealthy, but not in a state automation may restart (e.g.
@@ -715,7 +788,7 @@ else
                             FEED2=$(feed_doctor_line)
                             FEED_LEVEL2=""
                             if [ -n "$FEED2" ]; then
-                                IFS=$'\t' read -r FEED_LEVEL2 _ <<< "$FEED2"
+                                IFS=$'\t' read -r FEED_LEVEL2 _ _ <<< "$FEED2"
                             fi
                             case "$FEED_LEVEL2" in
                                 OK|QUIET)
@@ -801,6 +874,7 @@ except Exception as e:
 PYEOF
 )
 
+HEARTBEAT_PHASE="done"
 log "done. data=[$DATA_MSG] deploy=[$DEPLOY_MSG] feed=[$FEED_MSG] check=[$CHECK_MSG] handoff=[$HANDOFF_MSG] xm=[$XM_MSG]"
 
 # --- phase 5: notification policy ----------------------------------------------
@@ -851,3 +925,4 @@ if [ "$DEPLOY_FATAL" = "1" ]; then
     log "FATAL: deploy rollback could not be verified - manual intervention required (see deploy message above)"
     exit 1
 fi
+exit 0

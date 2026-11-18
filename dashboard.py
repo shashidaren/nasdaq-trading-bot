@@ -23,6 +23,134 @@ TRADES_FILE_PATH = os.getenv("NASDAQ_TRADES_FILE", os.path.join(DATA_DIR, "trade
 JOURNAL_FILE_PATH = os.getenv("NASDAQ_JOURNAL_FILE", os.path.join(DATA_DIR, "journal.csv"))
 MT5_FEED_FILE = os.getenv("MT5_FEED_FILE", os.path.join(DATA_DIR, "mt5_last_candle.json"))
 MT5_FEED_HEALTH_FILE = os.getenv("MT5_FEED_HEALTH_FILE", os.path.join(DATA_DIR, "mt5_feed_health.json"))
+AUTOSYNC_HEARTBEAT_FILE = os.getenv("AUTOSYNC_HEARTBEAT_FILE", os.path.join(DATA_DIR, "autosync_heartbeat.json"))
+AUTOSYNC_STALE_SECONDS = 45 * 60
+
+
+def autosync_status(heartbeat_path=None, now_epoch=None, max_age_s=AUTOSYNC_STALE_SECONDS):
+    """Read-only liveness summary of tools/autosync.sh's heartbeat stamp (STALE > 45 min)."""
+    heartbeat_path = heartbeat_path or AUTOSYNC_HEARTBEAT_FILE
+    now = time.time() if now_epoch is None else float(now_epoch)
+    stale_min = int(max_age_s // 60)
+    base = os.path.basename(heartbeat_path)
+    if not os.path.exists(heartbeat_path):
+        return {
+            "ok": False, "stale": False, "present": False, "level": "NO HEARTBEAT",
+            "age_s": None, "age_label": None, "ts_utc": None, "stale_min": stale_min,
+            "detail": f"{base} not found — waiting for next cron run, or cron is paused.",
+        }
+
+    def unreadable(reason):
+        return {
+            "ok": False, "stale": True, "present": True, "level": "UNREADABLE",
+            "age_s": None, "age_label": None, "ts_utc": None, "stale_min": stale_min,
+            "detail": f"{base} {reason}; check root crontab and /var/log/nasdaq-autosync.log.",
+        }
+
+    try:
+        with open(heartbeat_path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return unreadable("is unreadable or invalid JSON")
+    if not isinstance(payload, dict):
+        return unreadable("must be a JSON object")
+
+    ts_epoch = None
+    raw_epoch = payload.get("ts_epoch")
+    if raw_epoch is not None:
+        if isinstance(raw_epoch, bool):
+            return unreadable("has invalid ts_epoch")
+        try:
+            ts_epoch = float(raw_epoch)
+        except (TypeError, ValueError):
+            return unreadable("has invalid ts_epoch")
+        if not math.isfinite(ts_epoch) or ts_epoch <= 0:
+            return unreadable("has invalid ts_epoch")
+
+    raw_utc = payload.get("ts_utc")
+    parsed_utc = tape_pressure.parse_ts(raw_utc) if isinstance(raw_utc, str) else None
+    if ts_epoch is None:
+        if parsed_utc is None:
+            return unreadable("is missing ts_epoch/ts_utc")
+        ts_epoch = parsed_utc.replace(tzinfo=timezone.utc).timestamp()
+
+    try:
+        ts_utc = (parsed_utc.strftime("%Y-%m-%d %H:%M:%S") if parsed_utc is not None
+                  else datetime.fromtimestamp(ts_epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+    except (OSError, OverflowError, ValueError):
+        return unreadable("has out-of-range timestamp")
+
+    raw_rc = payload.get("exit_code", 0)
+    if isinstance(raw_rc, bool):
+        return unreadable("has invalid exit_code")
+    try:
+        exit_code = int(raw_rc)
+    except (TypeError, ValueError):
+        return unreadable("has invalid exit_code")
+
+    raw_status = payload.get("status", "ok")
+    if not isinstance(raw_status, str) or raw_status.strip().lower() not in ("ok", "warn", "error"):
+        return unreadable("has invalid status")
+    run_status = raw_status.strip().lower()
+
+    raw_age = now - ts_epoch
+    if raw_age < -60:
+        return {
+            "ok": False, "stale": True, "present": True, "level": "STALE",
+            "age_s": None, "age_label": "clock skew", "ts_utc": ts_utc, "stale_min": stale_min,
+            "detail": "Heartbeat timestamp is in the future; check host clock.",
+        }
+
+    age_s = max(0.0, raw_age)
+    if age_s < 90:
+        age_label = f"{int(round(age_s))}s ago"
+    elif max_age_s < age_s < max_age_s + 30:
+        age_label = f"{int(age_s // 60)}m {int(age_s % 60):02d}s ago"
+    elif age_s < 120 * 60:
+        age_label = f"{int(round(age_s / 60))} min ago"
+    else:
+        age_label = f"{age_s / 3600:.1f} h ago"
+
+    meta_parts = []
+    for key in ("push", "deploy", "notify"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            clean = val.strip()
+            if len(clean) > 48:
+                clean = clean[:45] + "..."
+            meta_parts.append(f"{key}: {clean}")
+    meta = " · ".join(meta_parts)
+
+    if age_s > max_age_s:
+        suffix = f" ({meta})" if meta else ""
+        return {
+            "ok": False, "stale": True, "present": True, "level": "STALE",
+            "age_s": round(age_s, 1), "age_label": age_label, "ts_utc": ts_utc,
+            "stale_min": stale_min,
+            "detail": f"Older than {stale_min} min — check root crontab & /var/log/nasdaq-autosync.log{suffix}",
+        }
+    if exit_code != 0 or run_status == "error":
+        phase = str(payload.get("phase") or "unknown").strip()[:24]
+        suffix = f" · {meta}" if meta else ""
+        return {
+            "ok": False, "stale": False, "present": True, "level": "ERROR",
+            "age_s": round(age_s, 1), "age_label": age_label, "ts_utc": ts_utc,
+            "stale_min": stale_min,
+            "detail": f"exit {exit_code} ({phase}){suffix}",
+        }
+    if run_status == "warn":
+        return {
+            "ok": False, "stale": False, "present": True, "level": "WARN",
+            "age_s": round(age_s, 1), "age_label": age_label, "ts_utc": ts_utc,
+            "stale_min": stale_min,
+            "detail": meta or "Completed with warnings; inspect /var/log/nasdaq-autosync.log.",
+        }
+    return {
+        "ok": True, "stale": False, "present": True, "level": "OK",
+        "age_s": round(age_s, 1), "age_label": age_label, "ts_utc": ts_utc,
+        "stale_min": stale_min,
+        "detail": meta or "Last autosync completed cleanly.",
+    }
 
 
 def feed_banner(status, health_path=None, feed_path=None, now_epoch=None):
@@ -633,12 +761,18 @@ HTML_TEMPLATE = """
             {% endif %}
 
             <!-- Feed + verdict strip -->
-            <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-6">
+            <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-4 mb-6">
                 <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
                     <p class="text-xs text-slate-400">M15 feed · checked now</p>
                     <p class="text-xl font-bold mt-1 {{ 'text-emerald-400' if feed.ok else 'text-rose-400' }}">{{ feed.level }}</p>
                     <p class="text-xs text-slate-400 mt-1">{{ feed.reason }} · {{ feed.detail or 'no feed data' }}</p>
                     <p class="text-xs text-slate-500 mt-1">{{ feed.lines[-1] }}</p>
+                </div>
+                <div data-card="autosync" class="bg-slate-800 p-4 rounded-xl border {{ 'border-rose-700/70' if autosync.stale or autosync.level == 'ERROR' else 'border-amber-700/60' if autosync.level == 'WARN' else 'border-slate-700' }}">
+                    <p class="text-xs text-slate-400">Autosync last run age</p>
+                    <p class="text-xl font-bold mt-1 {{ 'text-emerald-400' if autosync.ok else 'text-rose-400' if autosync.stale or autosync.level == 'ERROR' else 'text-amber-300' }}">{{ autosync.level }}{% if autosync.age_label %} · {{ autosync.age_label }}{% endif %}</p>
+                    <p class="text-xs text-slate-400 mt-1">{% if autosync.ts_utc %}{{ autosync.ts_utc }} UTC{% else %}no stamp{% endif %} · stale &gt; {{ autosync.stale_min }} min</p>
+                    <p class="text-xs text-slate-500 mt-1">{{ autosync.detail }}</p>
                 </div>
                 <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
                     <p class="text-xs text-slate-400">Post-gate closed trades</p>
@@ -851,6 +985,7 @@ def index():
     journal = list(reversed(journal))[:100]
 
     feed = feed_banner(status_for_readiness)
+    autosync = autosync_status()
     readiness = readiness_snapshot(status_for_readiness, status_available, feed)
     active_tab = request.path.strip("/") or "dashboard"
     return render_template_string(
@@ -865,6 +1000,7 @@ def index():
         location=location_read,
         trade_stats_warning=trade_stats_warning,
         feed=feed,
+        autosync=autosync,
         journal=journal,
         journal_error=journal_error,
         readiness=readiness,
