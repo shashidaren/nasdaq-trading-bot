@@ -67,6 +67,29 @@ def ok(msg):
     print(f"  [ ok ] {msg}")
 
 
+TORN = b"\x00"
+
+
+def check_torn_writes(path, label):
+    """A NUL byte is never legal in these CSVs - name the line instead of skipping it.
+
+    A torn/partial write leaves a row padded with NULs so it no longer starts at
+    column 0. The row values can be intact, but silently treating the row as
+    "unparsable (skipped)" is what let a padded row reach the readiness report.
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+    if TORN not in data:
+        return False
+    first = data.index(TORN)
+    line = data.count(b"\n", 0, first) + 1
+    count = data.count(TORN)
+    fail(f"{label}: {count} NUL byte(s) starting at line {line} - torn or partial write; "
+         f"run python3 tools/repair_log.py --check (then --apply) to repair it without "
+         f"changing any value")
+    return True
+
+
 def parse_dt(s):
     try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
@@ -94,6 +117,7 @@ def _gap_is_market_closure(a_naive: datetime, b_naive: datetime) -> bool:
 
 def check_trades():
     print("\n== trades.csv ==")
+    check_torn_writes(TRADES, "trades.csv")
     with open(TRADES, newline="") as f:
         rdr = csv.reader(f)
         header = next(rdr, None)
@@ -178,6 +202,7 @@ def check_trades():
 
 def check_log():
     print("\n== forward_test_log.csv ==")
+    check_torn_writes(LOG, "forward_test_log.csv")
     with open(LOG, newline="") as f:
         rdr = csv.reader(f)
         header = next(rdr, None)
@@ -187,20 +212,23 @@ def check_log():
     else:
         ok(f"header ok ({len(raw)} rows)")
 
-    dts, badnum = [], 0
-    for r in raw:
+    dts, bad = [], []
+    for lineno, r in enumerate(raw, start=2):
         dt = parse_dt(r[0]) if r else None
         if dt is None:
-            badnum += 1
+            bad.append(lineno)
             continue
         dts.append(dt)
         try:
             float(str(r[1]).replace(",", "")); float(str(r[2]).replace(",", ""))
             float(str(r[3]).replace(",", "")); float(str(r[4]).replace(",", ""))
         except (ValueError, IndexError):
-            badnum += 1
-    if badnum:
-        warn(f"{badnum} rows with unparsable timestamp/OHLC (skipped)")
+            bad.append(lineno)
+    if bad:
+        named = ", ".join(str(line) for line in bad[:5]) + (" ..." if len(bad) > 5 else "")
+        fail(f"{len(bad)} rows with unparsable timestamp/OHLC at line(s) {named} - a malformed "
+             f"forward-test row is corruption, not a warning; run python3 tools/repair_log.py "
+             f"--check (it names torn rows) and repair anything else by hand")
     else:
         ok("timestamps + OHLC all parse")
     regress = sum(1 for a, b in zip(dts, dts[1:]) if b <= a)
@@ -224,6 +252,7 @@ def check_log():
 
 def check_skips():
     print("\n== skipped_trades.csv ==")
+    check_torn_writes(SKIPS, "skipped_trades.csv")
     with open(SKIPS, newline="") as f:
         rdr = csv.reader(f)
         header = next(rdr, None)

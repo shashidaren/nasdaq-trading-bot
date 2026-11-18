@@ -3,20 +3,20 @@
 <!-- HANDOFF-SNAPSHOT machine-checked by tools/handoff_check.py; refresh with --update -->
 | key | value |
 |---|---|
-| as_of_utc | 2026-11-04 08:15 |
-| data_collection | 5239 |
-| closed_trades | 2 |
-| wins_losses | 1W/1L |
-| win_rate_pct | 50.0 |
-| engine_ledger_usd | 213.88 |
-| true_equity_usd | 213.89 |
-| live_era_trades | 2 |
-| live_era_net_usd | +13.39 |
-| log_covered_trades | 2 |
-| log_bars | 529 |
-| log_last_bar_utc | 2026-11-04 08:15 |
+| as_of_utc | 2026-11-17 09:30 |
+| data_collection | 5244 |
+| closed_trades | 6 |
+| wins_losses | 2W/4L |
+| win_rate_pct | 33.3 |
+| engine_ledger_usd | 194.22 |
+| true_equity_usd | 194.23 |
+| live_era_trades | 6 |
+| live_era_net_usd | -7.27 |
+| log_covered_trades | 6 |
+| log_bars | 1276 |
+| log_last_bar_utc | 2026-11-17 09:30 |
 | skip_rows | 0 |
-| open_trade | none |
+| open_trade | SELL #7 @ 27292.4 |
 | spread_usd_per_trade | 0.25 |
 <!-- /HANDOFF-SNAPSHOT -->
 
@@ -26,8 +26,9 @@
 
 This repository auto-trades XM's **Nasdaq-100 Cash Index CFD (`US100Cash`)** on **15-minute (`M15`)** candles under **`/opt/nasdaq`** (cutover date **2026-10-24**; all legacy data discarded).
 
-> **⚠️ 2026-11-13 session — feed outage resolved; evidence base still tiny.** The 2026-11-02 freeze (ledger stuck at 2026-10-30 20:45 UTC while `xm_data/` ran on) was root-caused on the VPS: `mt5feed-nasdaq` lost its MT5 handle (`NO_RATES`, `(-10004, 'No IPC connection')`, 291 reconnects, fresh heartbeat over a frozen feed file) and had no reconnect path for that status. The sidecar was restarted and the engine's first post-outage bar is **2026-11-02 12:45 UTC**; evidence now runs through **2026-11-04 08:15 UTC** (529 bars, data collection 5239). The ledger holds **2 closed trades (1W/1L, gross $213.88)** and `live_readiness.py` is at **2/100 — 0/6 data gates** (feed gate FAIL: worst open-market gap 810 min). **53 open-market bars (2.7 days) are permanently lost: do not backfill the forward ledger**; the first ~14 post-outage bars are indicator-contaminated. Both `handoff_check.py` (engine-lag fail-closed) and the ladder in `docs/EXECUTION-PLAN.md` verify this checkout — the checked-in snapshot is never a live-feed health check, so re-run `tools/feed_doctor.py` + §6 on `/opt/nasdaq` each session (last log bar and last GitHub push both stop at 2026-11-04 08:15 UTC here). **2026-11-17 update:** `handoff_check.py` now also compares the newest evidence with the wall clock, so this frozen checkout reports **HANDOFF STALE** (819 open-market M15 bars / 312 h with no new bar or quote) instead of the false `FRESH` it printed for 13 days — `--update` re-stamps the block honestly but exits 1 while the pipeline is frozen.
+> **⚠️ 2026-11-13 session — feed outage resolved; evidence base still tiny.** The 2026-11-02 freeze (ledger stuck at 2026-10-30 20:45 UTC while `xm_data/` ran on) was root-caused on the VPS: `mt5feed-nasdaq` lost its MT5 handle (`NO_RATES`, `(-10004, 'No IPC connection')`, 291 reconnects, fresh heartbeat over a frozen feed file) and had no reconnect path for that status. The sidecar was restarted and the engine's first post-outage bar is **2026-11-02 12:45 UTC**; evidence ran through **2026-11-04 08:15 UTC** at that review (529 bars, data collection 5239); it now runs to **2026-11-17 09:30 UTC** (1276 bars, 5244) - see the 2026-11-18 note below. The ledger then held **2 closed trades (1W/1L, gross $213.88)**; it now holds **6 (2W/4L, gross $194.22)** and `live_readiness.py` is at **6/100 post-gate trades — still 0/6 data gates** (feed gate FAIL: worst open-market gap 690 min). **53 open-market bars (2.7 days) are permanently lost: do not backfill the forward ledger**; the first ~14 post-outage bars are indicator-contaminated. Both `handoff_check.py` (engine-lag fail-closed) and the ladder in `docs/EXECUTION-PLAN.md` verify this checkout — the checked-in snapshot is never a live-feed health check, so re-run `tools/feed_doctor.py` + §6 on `/opt/nasdaq` each session (the newest bar in this checkout was 2026-11-04 08:15 UTC at that review and is 2026-11-17 09:30 UTC now; the pipeline is frozen). **2026-11-17 update:** `handoff_check.py` now also compares the newest evidence with the wall clock, so this frozen checkout reports **HANDOFF STALE** (819 open-market M15 bars / 312 h at that review, 105 bars / 27.7 h now) instead of the false `FRESH` it printed for 13 days — `--update` re-stamps the block honestly but exits 1 while the pipeline is frozen.
 
+- **2026-11-18 update — the Readiness tab was blank because of a torn write, not a code path.** `forward_test_log.csv` carried **140 NUL bytes before the 2026-11-04 19:30 bar** (a partial/sparse append), so every strict reader failed closed and `/readiness` rendered *"Readiness could not be computed. Evidence unavailable or invalid: forward_test_log.csv contains unparseable rows…"* while `check_data.py` only warned "1 rows with unparsable timestamp/OHLC (skipped)" and exited 0. Fixed on this branch: `tools/repair_log.py` (`--check`/`--apply`, backup + strict re-validation, refuses lost-data holes), NUL/line diagnostics in `live_readiness.py` + `check_data.py` (a malformed row is now a FAIL, not a warning), and an engine append guard that never glues a row onto a torn tail. The checked-in log was repaired with the tool (only the 140 NULs removed; 1276 bars, values untouched) and the tab renders again: **6 closed trades (2W/4L), 0/6 data gates, worst open-market gap 690 min**. Note the pipeline itself is still frozen: newest evidence is **2026-11-17 09:30 UTC** and `status.json` again shows the sidecar's `NO_RATES` / `(-10004, 'No IPC connection')` signature — task 1.0 on the VPS still applies (`tools/feed_doctor.py`, `systemctl status mt5feed-nasdaq nasdaq-engine`, and confirm the autosync cron is actually running).
 - **Day-0 Nasdaq ledger:** Root `trades.csv`, `forward_test_log.csv`, `skipped_trades.csv`, and `status.json` start clean at **$200.00** equity (`0W/0L`, `symbol: "US100Cash"`, `timeframe: "M15"`).
 - **Execution mode:** `TRADING_MODE = "FORWARD_TEST"` and `DATA_SOURCE = "MT5"` by default. Both the direct `MetaTrader5` path and the Linux Wine atomic file-bridge (`tools/mt5_executor.py` via `/opt/nasdaq/mt5_bridge/`) are implemented. `tools/live_path_probe.py` reports `11/11` checks against **fake MT5 in temporary directories**, not a broker demo. `MT5_EXEC_ENABLED=0` and `MT5_EXEC_ALLOW_REAL=0` remain locked off until the preceding phases and demo validation (`docs/START-LEVER1.md`) complete.
 
@@ -98,6 +99,7 @@ Follow `docs/EXECUTION-PLAN.md` in order; do not move to demo execution or real 
 ```bash
 # Always run integrity + freshness + regression checks first:
 python3 tools/feed_doctor.py          # feed reason/heartbeat/witness (exit 0 OK, 1 stale, 2 broken)
+python3 tools/repair_log.py --check   # torn/NUL-padded evidence rows (exit 1 -> --apply, backup first)
 python3 tools/check_data.py
 python3 tools/handoff_check.py
 python3 tools/smoke_test.py

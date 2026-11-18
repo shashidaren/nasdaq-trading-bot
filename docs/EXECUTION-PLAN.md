@@ -130,6 +130,66 @@ gate that could not see a fully frozen pipeline.
 open-market bars are *not* explainable by market closure and must be treated as lost
 forward-test evidence — do not backfill.
 
+### Re-review notes — 2026-11-18 (Readiness tab unusable: torn write in the evidence log)
+
+The operator report was "it still says readiness cannot be computed". `/readiness` rendered
+exactly that, with `Evidence unavailable or invalid: forward_test_log.csv contains unparseable
+rows or changed while being read`. Phase 1 task 1.3 (Readiness tab) was therefore failing in
+practice even though the code, the gates and the CLI were correct.
+
+**Root cause (data, not code):** `forward_test_log.csv` carried **140 NUL bytes before the
+2026-11-04 19:30:00 bar** (file size was exactly 180002 bytes - a partial/sparse append left a
+hole, so that row did not start at column 0). `live_readiness.load_readiness_data()` compares
+the count of rows `csv.DictReader` can parse with the count of rows in the file, correctly sees
+a mismatch, and fails closed. Three things made that hard to see:
+
+| Evidence | Before | Reading |
+|---|---|---|
+| `/readiness` | `NOT READY — EVIDENCE UNAVAILABLE`, "contains unparseable rows" | Correct fail-closed, zero diagnostic value |
+| `tools/check_data.py` | exit **0**, `[WARN] 1 rows with unparsable timestamp/OHLC (skipped)` | Integrity gate passed a corrupted evidence file |
+| `tools/live_readiness.py` | exit 1, same opaque message | CLI and tab agree, neither names the line |
+| `git status` / data review | clean | The corruption is *inside* a committed row, not a stray line |
+
+**Fixed on this branch (tooling correctness + one data repair; no trading evidence created):**
+
+1. **`tools/repair_log.py` (new).** `--check` names the file, line, column and NUL count and
+   exits 1; `--apply` removes **only** NUL bytes (plus a missing trailing newline), writes a
+   `<file>.bak-YYYYmmddTHHMMSSZ` backup, re-validates the repaired pair with the strict
+   `live_readiness` loader, and restores the backups / exits 2 if anything does not validate.
+   It refuses when the padding hid *lost* row bytes: that is a human decision, not a repair.
+   Nothing else is touched - no value, no row order, no row count, no backfill.
+2. **`live_readiness.py`** detects NUL padding before parsing and raises with
+   `forward_test_log.csv has 140 NUL byte(s) starting at line 530, column 0 - a torn or partial
+   write ... run python3 tools/repair_log.py --check, then --apply`, plus line numbers for
+   invalid/unordered bars. The gate logic is unchanged.
+3. **`check_data.py`** fails (exit 1) on NUL bytes and on unparsable rows instead of warning and
+   skipping them, so the autosync integrity gate can no longer bless a torn evidence file.
+4. **`engine.py`** checks the log tail before appending (`ensure_appendable_log`): it never glues
+   a bar onto a partial line, adds a missing newline, and warns with the repair command when the
+   tail is NUL-padded. It never edits or truncates evidence.
+5. **`forward_test_log.csv`** repaired with the tool: 140 NUL bytes removed, everything else
+   byte-identical (1276 bars, same timestamps/OHLC, `check_data.py` exit 0).
+6. **Regressions:** `tests/test_repair_log.py` (7 tests: check never writes, apply removes only
+   padding, backups, lost-data hole refused, failed validation rolled back, trailing newline,
+   engine guard) and a dashboard test asserting `/readiness` names the repair command.
+
+**Result:** the Readiness tab renders again on the checked-in evidence - 6 closed trades (2W/4L),
+**0/6 data gates** (sample 6/100, feed gate worst open-market gap 690 min), verdict
+`NOT READY — FEED` in this isolated checkout, plus the unsigned non-data checklist.
+
+**Still the operator's job (nothing above changes the verdict):**
+
+- **Run the repair on the VPS if the file is still torn there:**
+  `cd /opt/nasdaq && python3 tools/repair_log.py --check` (exit 1 → `--apply`). Do this after the
+  deploy lands: autosync merges *data files* with "server wins", so a locally modified
+  `forward_test_log.csv` keeps the server copy and the padding survives the merge.
+- **Task 1.0 remains P0.** The pipeline is still frozen: newest evidence **2026-11-17 09:30 UTC**,
+  `handoff_check.py` STALE (27.7 h), and `status.json` shows the sidecar signature from the
+  October incident (`status: NO_RATES`, `last_error: (-10004, 'No IPC connection')`). Confirm the
+  autosync cron is running at all - the feed self-heal is in `autosync.sh`, so a frozen pipeline
+  with a dead handle means cron did not run or the whole host is down.
+- **Do not** treat the repair as evidence: the 140-byte repair restores readability, not trades.
+
 ---
 
 ## Phase 2 — Statistical Evidence (forward-test accumulation)

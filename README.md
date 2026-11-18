@@ -48,6 +48,7 @@ python3 tools/live_path_probe.py
 python3 tools/feed_doctor.py
 
 # 4. Data integrity, HANDOFF snapshot freshness & engine liveness
+python3 tools/repair_log.py --check   # torn/NUL-padded evidence rows (exit 1 = repair with --apply)
 python3 tools/check_data.py
 python3 tools/handoff_check.py    # also reports "engine lag" when xm_data runs ahead of the engine
 
@@ -58,6 +59,8 @@ python3 tools/backtest.py xm_data/candles_m15.csv --spread 0.25
 # 6. Readiness regression suite (install Flask to run the dashboard-specific tests)
 python3 -m unittest discover -s tests -v
 ```
+
+`tools/repair_log.py` repairs *torn writes* only — a row left padded with NUL bytes so it no longer starts at column 0 (2026-11-18: 140 NUL bytes before the `2026-11-04 19:30` bar). It removes the padding, keeps every value and every row, writes a timestamped backup, and re-validates with the strict readiness loader; it refuses (and restores the backup) when the damage is lost data rather than padding. Both `check_data.py` and the Readiness tab name the file, line and repair command instead of only saying the evidence is unavailable.
 
 The Readiness page and `tools/live_readiness.py` share the same post-gate data calculations. Fewer than ten trades leaves statistical results **UNKNOWN**; passing all six data gates is necessary but not sufficient for real-money trading. Current feed/heartbeat health, recent engine/log snapshots and the manually signed contract, cost, demo-soak and kill-switch checks remain separate requirements.
 
