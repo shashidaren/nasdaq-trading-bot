@@ -1,10 +1,10 @@
 # Execution Plan — Nasdaq-100 (`US100Cash`) M15 Bot
 
 **Branch:** the active development branch (`arena/...`); never work on `main` directly
-**Reviewed:** 2026-10-30, **re-reviewed 2026-11-02 12:35 UTC, re-re-reviewed 2026-11-13 (checkout ladder green)**
-**Status:** **Phase 1 verification green in this checkout (2026-11-13); VPS-side re-verification and Phase 2 accumulation remain.** The 2026-10-30 feed outage was root-caused on the VPS (2026-11-02 12:44 UTC): `mt5feed-nasdaq`'s MT5 handle died (`status: NO_RATES`, `last_error: copy_rates_from_pos failed: (-10004, 'No IPC connection')`, `reconnects: 291`, feed file unwritten since 2026-10-31 03:01 UTC) and the sidecar's bounded reconnect path only ran for `TICK_FROZEN`, so it kept rewriting a fresh heartbeat over a frozen feed file — while `nasdaq-engine` correctly stayed `active (running)` and refused to trade (`MT5: feed stale [CANDLE_OLD]`), and the separate `mt5quotes-nasdaq` logger kept `xm_data/` alive. The sidecar was restarted and the engine's first post-outage bar is **2026-11-02 12:45 UTC**; evidence now runs through **2026-11-04 08:15 UTC** (529 log bars, data collection 5239, 2 closed trades 1W/1L, gross ledger $213.88). **53 open-market M15 bars (2.7 days, 2026-10-30 20:45 → 2026-11-02 12:45) of forward-test evidence remain permanently lost — do not backfill**; Phase 2 sits at 2/100 post-gate trades (0/6 data gates; feed gate FAIL, worst open-market gap 810 min inside the 14-day window), and the first ~14 post-outage bars are indicator-contaminated. Ladder in this checkout (2026-11-13): `check_data.py` exit 0 (2 warnings investigated: maintenance-adjacent 21:00 UTC slots + the documented outage run), `pytest tests/` 56 passed, `smoke_test.py` scenarios A–S all PASS (Flask installed), `live_path_probe.py` 11/11, `handoff_check.py` FRESH after `--update` **at the time — see the 2026-11-17 re-review: that FRESH was a false green once the whole pipeline froze**, dashboard Readiness tab verified on `:6001` (six gates, stats, verdict, unsigned checklist). `feed_doctor.py` still reports `FILE_MISSING /opt/nasdaq` here — **expected in an isolated checkout, and not evidence about the VPS: re-run the ladder on `/opt/nasdaq` every session**, where the last evidence bar and the last GitHub push both stop at **2026-11-04 08:15 UTC** (confirm the pipeline is still moving). The reconnect fix (`should_reconnect()` on `NO_RATES`/`TERMINAL_DISCONNECTED`) and the safe autosync rollback are both present on `main` (5ff4498) with their regression tests; the controlled VPS autosync hand-deploy procedure (operator pauses cron, updates `tools/autosync.sh` by hand, verifies, resumes cron) still applies before relying on auto-deploy (operator-approved; see the Phase 1 notes below and `docs/AUTOSYNC.md`).
+**Reviewed:** 2026-10-30, **re-reviewed 2026-11-02 12:35 UTC, 2026-11-13, 2026-11-17, and 2026-11-18 (torn-write repair + 13:48 UTC post-recovery review)**
+**Status:** **Phase 1 verification green in this checkout (2026-11-13, re-verified 2026-11-18); Phase 2 accumulation continues (8/100 post-gate trades, 0/6 data gates).** The 2026-10-30 feed outage was root-caused on the VPS (2026-11-02 12:44 UTC): `mt5feed-nasdaq`'s MT5 handle died (`status: NO_RATES`, `last_error: copy_rates_from_pos failed: (-10004, 'No IPC connection')`, `reconnects: 291`, feed file unwritten since 2026-10-31 03:01 UTC) and the sidecar's bounded reconnect path only ran for `TICK_FROZEN`, so it kept rewriting a fresh heartbeat over a frozen feed file — while `nasdaq-engine` correctly stayed `active (running)` and refused to trade (`MT5: feed stale [CANDLE_OLD]`), and the separate `mt5quotes-nasdaq` logger kept `xm_data/` alive. The sidecar was restarted and the engine's first post-outage bar is **2026-11-02 12:45 UTC**; evidence now runs through **2026-11-04 08:15 UTC** (529 log bars, data collection 5239, 2 closed trades 1W/1L, gross ledger $213.88). **53 open-market M15 bars (2.7 days, 2026-10-30 20:45 → 2026-11-02 12:45) of forward-test evidence remain permanently lost — do not backfill**; Phase 2 sits at 2/100 post-gate trades (0/6 data gates; feed gate FAIL, worst open-market gap 810 min inside the 14-day window), and the first ~14 post-outage bars are indicator-contaminated. Ladder in this checkout (2026-11-13): `check_data.py` exit 0 (2 warnings investigated: maintenance-adjacent 21:00 UTC slots + the documented outage run), `pytest tests/` 56 passed, `smoke_test.py` scenarios A–S all PASS (Flask installed), `live_path_probe.py` 11/11, `handoff_check.py` FRESH after `--update` **at the time — see the 2026-11-17 re-review: that FRESH was a false green once the whole pipeline froze**, dashboard Readiness tab verified on `:6001` (six gates, stats, verdict, unsigned checklist). `feed_doctor.py` still reports `FILE_MISSING /opt/nasdaq` here — **expected in an isolated checkout, and not evidence about the VPS: re-run the ladder on `/opt/nasdaq` every session**, where the last evidence bar and the last GitHub push both stop at **2026-11-04 08:15 UTC** (confirm the pipeline is still moving). The reconnect fix (`should_reconnect()` on `NO_RATES`/`TERMINAL_DISCONNECTED`) and the safe autosync rollback are both present on `main` (5ff4498) with their regression tests; the controlled VPS autosync hand-deploy procedure (operator pauses cron, updates `tools/autosync.sh` by hand, verifies, resumes cron) still applies before relying on auto-deploy (operator-approved; see the Phase 1 notes below and `docs/AUTOSYNC.md`).
 
-The checked-in snapshot is **not live telemetry**: `status.json` records FORWARD_TEST, two closed trades (1W/1L) and a gross engine ledger of $213.88 — as of **2026-11-04 08:15 UTC**, i.e. frozen at the snapshot's `as_of`. A historical `feed: OK` in that file does not prove the feed is currently healthy, and a matching HANDOFF snapshot does not prove the engine is alive (before 2026-11-02 every snapshot key was derived from the engine's own frozen files, so `handoff_check.py` reported FRESH throughout the outage; it now fails closed on engine lag).
+The checked-in snapshot is **not live telemetry**: `status.json` records FORWARD_TEST, **8 closed trades (3W/5L)** and a gross engine ledger of **$206.27** as of **2026-11-18 13:45 UTC** — see the 2026-11-18 13:48 UTC re-review note at the end of Phase 1 (2 closed trades / $213.88 as of 2026-11-04 08:15 UTC is the superseded state), i.e. frozen at the snapshot's `as_of`. A historical `feed: OK` in that file does not prove the feed is currently healthy, and a matching HANDOFF snapshot does not prove the engine is alive (before 2026-11-02 every snapshot key was derived from the engine's own frozen files, so `handoff_check.py` reported FRESH throughout the outage; it now fails closed on engine lag).
 
 Every prompt in this session should follow this plan. Work is ordered: **stabilize → evidence → soak → gates → live**. Do not skip a phase.
 
@@ -189,6 +189,62 @@ a mismatch, and fails closed. Three things made that hard to see:
   autosync cron is running at all - the feed self-heal is in `autosync.sh`, so a frozen pipeline
   with a dead handle means cron did not run or the whole host is down.
 - **Do not** treat the repair as evidence: the 140-byte repair restores readability, not trades.
+
+### Re-review notes — 2026-11-18 13:48 UTC (pipeline restored; duplicate `Trade_Num` fix, autosync heartbeat, feed churn advisory)
+
+Live VPS state verified at **2026-11-18 13:48 UTC**: the 11-17→18 silence came from a
+commented-out autosync cron line combined with `NOTIFY=off`. Cron is re-enabled and deploying
+(`push: ok`, `deploy=[none]`, `data collection 5249`, `HEAD == origin/main`, `handoff: fresh`,
+`engine lag 0 bars`, `check_data 0 fail / 2 warn` on historical gaps only). The ledger holds
+**8 closed trades (3W/5L, equity $206.27, 1,384 logged M15 bars)** and `/readiness` renders
+cleanly (**0/6 data gates, 8/100 post-gate trades**, verdict `NOT READY — DATA GATES` on the
+VPS / `NOT READY — FEED` in an isolated checkout).
+
+**Duplicate `Trade_Num` #7 — root cause & fix:**
+
+- Two genuine `SELL` trades on 2026-11-17 both carried `Trade_Num = 7` (entry `02:15` → `TP`
+  `15:45`, equity `$225.78`; entry `21:15` → `SL` `21:45`, equity `$206.27`). Renumbered once
+  on the VPS to `#7` and `#8` with every price, profit, and `Balance_After` link untouched.
+- **Root cause (`journal.csv` + `engine.py`):** the engine restarted mid-trade at `2026-11-17
+  09:41 UTC`. `load_trade_stats()` set `next_trade_num = max(Trade_Num) + 1 = 7` from the
+  6-row closed ledger, then `restore_open_trade_from_status()` restored `current_trade_num = 7`
+  from `status.json` *without* advancing `next_trade_num`. When `#7` closed at `15:45`,
+  `next_trade_num` was still `7`, so the `21:15` entry emitted a second `#7`.
+- **Fixed on this branch (code/tests/docs only — no tracked data files touched):**
+  1. **P0 — `engine.py` single allocator & duplicate guard:** `_allocate_trade_num()` returns
+     `max(next_trade_num, max_closed_in_trades_csv + 1)` and advances `next_trade_num` across
+     every entry path (simulated, direct MT5, direct MT5 `None`-reconcile, Wine bridge, legacy
+     restore fallback, startup broker reconcile). Both `restore_open_trade_from_status()` and
+     every close/`log_trade()` force `next_trade_num >= max(next_trade_num, current_trade_num + 1,
+     max_closed + 1)`. `log_trade()` fails closed on duplicate, non-increasing, invalid, or
+     NUL-corrupted `Trade_Num` (journals `TRADE_NUM_DUPLICATE` / `TRADE_NUM_ORDER_ERROR` /
+     `TRADE_NUM_ERROR`, appends nothing, never rewrites history). `migrate_trades_csv()` also
+     leaves NUL-padded files untouched.
+  2. **P0 — `tools/check_data.py`:** duplicate, missing, blank, non-positive, unparsable, and
+     out-of-order `Trade_Num` values are now `FAIL` (exit 1, naming the offending numbers/lines)
+     instead of `WARN`.
+  3. **P1 — autosync liveness on `/readiness`:** `tools/autosync.sh` atomically writes a
+     gitignored `autosync_heartbeat.json` (`HEARTBEAT_FILE`) on every run (via `EXIT` trap,
+     recording `ts_utc`, `ts_epoch`, `status`, `exit_code`, `phase`, `push`, `deploy`, `notify`),
+     and `dashboard.py` surfaces a read-only **Autosync last run age** card on `/readiness`
+     (`STALE` when `> 45 min`, `NO HEARTBEAT` when absent, `WARN`/`ERROR`/`UNREADABLE` fail-closed).
+  4. **P2 — `tools/feed_doctor.py` reconnect-churn advisory:** keeps `STALE` (exit 1) for real
+     feed staleness and `BROKEN` (exit 2) for structural faults, while reporting elevated sidecar
+     reconnect churn (`>= 2` reconnects over `>= 15 min` uptime, `> 1.00/h` — e.g. `1.29/h` with
+     a 2-minute-old bar) as its own `reconnect_churn` / `advisories` advisory under `OK - feed
+     flowing (reconnect churn advisory: ...)` (exit 0) instead of misclassifying a flowing feed
+     as `STALE`.
+  5. **Regressions:** `tests/test_trade_numbering.py` (simulated restart, all LIVE/bridge/orphan
+     paths, duplicate/non-increasing/torn `log_trade` refusal, `check_data.py` FAIL checks),
+     `tools/smoke_test.py` Scenario E/O/R extensions, `tests/test_autosync.py` heartbeat + churn
+     integration, `tests/test_readiness.py` `/readiness` temp-file autosync age tests, and
+     `tests/test_feed_doctor.py` churn advisory suite.
+
+**What did NOT change:** no readiness gate was loosened and no live data was edited. Phase 2
+continues accumulating from **8/100 post-gate trades (0/6 data gates)**. Operator follow-ups on
+`/opt/nasdaq`: watch the next autosync run deploy and restart `nasdaq-engine` +
+`nasdaq-dashboard`, inspect `mt5feed-nasdaq` 24 h reconnect logs, and consider `NOTIFY=alerts`
+in `/opt/nasdaq/.env`.
 
 ---
 

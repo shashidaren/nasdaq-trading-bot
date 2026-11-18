@@ -13,7 +13,8 @@ Answers the four questions an operator actually has, in order:
      DOWN = the counter restarted because the engine restarted, not because the feed
      recovered)
 
-Exit codes: 0 feed healthy, 1 feed stale/degraded (market open), 2 feed broken
+Exit codes: 0 feed flowing (OK, with or without reconnect-churn advisory) or
+market closed (QUIET), 1 feed genuinely stale (market open), 2 feed broken
 (missing/unreadable/foreign/wrong schema) - never 2 just because the market is shut.
 
 Usage:
@@ -32,9 +33,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-# A reconnect loop is a degraded feed even if the last candle is momentarily
-# fresh. Require a meaningful observation window and at least two attempts so
-# a single startup recovery does not trigger the gate.
+# Elevated sidecar reconnect churn is surfaced as its own advisory rather than
+# misclassifying a genuinely flowing feed (fresh closed bar) as STALE. Require a
+# meaningful observation window and at least two attempts so a single startup
+# recovery does not trigger the advisory.
 RECONNECT_CHURN_MIN_WINDOW_S = 15 * 60
 RECONNECT_CHURN_MIN_COUNT = 2
 RECONNECT_CHURN_MAX_PER_HOUR = 1.0
@@ -168,6 +170,7 @@ def build_report(data_dir, journal_path, now_epoch=None, expected_symbol="US100C
     resets = FH.detect_counter_resets(events)
 
     reconnect_churn = _reconnect_churn(health)
+    advisories = [reconnect_churn["advisory"]] if reconnect_churn.get("advisory") else []
 
     quiet, hours_label = _market_state(now_epoch)
     if assume_open:
@@ -182,6 +185,7 @@ def build_report(data_dir, journal_path, now_epoch=None, expected_symbol="US100C
         "feed": {k: v for k, v in diag.items() if k != "rates"},
         "sidecar": health,
         "reconnect_churn": reconnect_churn,
+        "advisories": advisories,
         "warmup": warmup,
         "persisted_offset": offset,
         "witness": witness,
@@ -196,31 +200,46 @@ def build_report(data_dir, journal_path, now_epoch=None, expected_symbol="US100C
 
 
 def _reconnect_churn(health):
-    """Summarize reconnect attempts per sidecar uptime and apply the churn gate.
+    """Summarize reconnect attempts per sidecar uptime and build any churn advisory.
 
     The health file exposes a process-lifetime counter and uptime. Its rate is
     therefore a bounded observation window which naturally resets when the
     sidecar restarts. Ignore short startup windows and isolated reconnects.
+    Churn is reported as its own advisory so a flowing feed with a fresh M15 bar
+    is distinguished from a genuinely STALE feed.
     """
     count = health.get("reconnects")
     uptime = health.get("uptime_s")
+    if isinstance(count, bool) or isinstance(uptime, bool):
+        count, uptime = None, None
     try:
         count = int(count)
         uptime = float(uptime)
     except (TypeError, ValueError):
         count, uptime = None, None
-    rate = count * 3600.0 / uptime if count is not None and uptime and uptime > 0 else None
-    degraded = bool(count is not None and uptime is not None
+    rate = count * 3600.0 / uptime if count is not None and count >= 0 and uptime and uptime > 0 else None
+    rounded_rate = round(rate, 2) if rate is not None else None
+    elevated = bool(rate is not None
                     and uptime >= RECONNECT_CHURN_MIN_WINDOW_S
                     and count >= RECONNECT_CHURN_MIN_COUNT
                     and rate > RECONNECT_CHURN_MAX_PER_HOUR)
+    advisory = None
+    if elevated:
+        advisory = (
+            "sidecar reconnect churn elevated: {} attempts over {:.1f} h "
+            "({:.2f}/h, threshold {:.2f}/h); inspect mt5feed-nasdaq journal "
+            "and terminal/IPC stability".format(
+                count, uptime / 3600.0, rate, RECONNECT_CHURN_MAX_PER_HOUR,
+            )
+        )
     return {
         "count": count,
         "uptime_s": uptime,
-        "rate_per_hour": round(rate, 2) if rate is not None else None,
+        "rate_per_hour": rounded_rate,
         "threshold_per_hour": RECONNECT_CHURN_MAX_PER_HOUR,
         "minimum_window_s": RECONNECT_CHURN_MIN_WINDOW_S,
-        "degraded": degraded,
+        "elevated": elevated,
+        "advisory": advisory,
     }
 
 
@@ -301,15 +320,22 @@ def _verdict(diag, health, witness, quiet, reconnect_churn=None):
                      "mt5feed-nasdaq service/process; after it recovers, confirm the engine logs "
                      "new bars (docs/STALE-FEED-TRIAGE.md, resume-after-outage)")
 
-    if reconnect_churn and reconnect_churn.get("degraded"):
-        steps.insert(0, "sidecar reconnect churn is elevated: {} attempts over {:.1f} h "
-                     "({:.2f}/h, threshold {:.2f}/h); inspect mt5feed-nasdaq journal and "
-                     "terminal/IPC stability before calling the feed healthy".format(
-                         reconnect_churn["count"], reconnect_churn["uptime_s"] / 3600.0,
-                         reconnect_churn["rate_per_hour"],
-                         reconnect_churn["threshold_per_hour"]))
-        return ("STALE", f"feed degraded by reconnect churn - {diag.get('detail')}", steps)
+    churn_elevated = bool(reconnect_churn and reconnect_churn.get("elevated"))
+    churn_advisory = (reconnect_churn or {}).get("advisory")
+    if churn_advisory:
+        steps.append(churn_advisory)
+
     if reason == FH.REASON_OK:
+        if churn_elevated:
+            return (
+                "OK",
+                "feed flowing (reconnect churn advisory: {:.2f}/h > {:.2f}/h) - {}".format(
+                    reconnect_churn["rate_per_hour"],
+                    reconnect_churn["threshold_per_hour"],
+                    diag.get("detail"),
+                ),
+                steps,
+            )
         return ("OK", f"feed healthy - {diag.get('detail')}", steps)
     if quiet:
         return ("QUIET", f"feed {reason} but the market is closed ({diag.get('detail')})",
@@ -332,6 +358,8 @@ def _print_detail(report):
     print(f"market      : {'QUIET/closed' if report['market']['quiet'] else 'OPEN'}"
           f" ({report['market']['label']})")
     print(f"verdict     : {level} - {headline}")
+    for adv in report.get("advisories") or ():
+        print(f"advisory    : {adv}")
     print()
     sc = report["sidecar"]
     w = report["witness"]
@@ -353,8 +381,10 @@ def _print_detail(report):
         churn = report["reconnect_churn"]
         rate = churn.get("rate_per_hour")
         churn_text = "n/a" if rate is None else f"{rate:.2f}/h"
+        churn_flag = (f"  [ADVISORY > {churn['threshold_per_hour']:.2f}/h]"
+                      if churn.get("elevated") else "")
         print(f"  offset    : {sc['server_offset_s']}  reconnects: {sc['reconnects']} "
-              f"({churn_text} over {(_fmt_minutes(churn.get('uptime_s')))} uptime)")
+              f"({churn_text} over {(_fmt_minutes(churn.get('uptime_s')))} uptime){churn_flag}")
         print(f"  last error: {sc['last_error']}")
     else:
         print("  no heartbeat file (tools/mt5_feed.py not running, or writing elsewhere)")

@@ -251,6 +251,38 @@ with redirect_stdout(io.StringIO()):
 check("E: EMA50 history seeded from M15 CSV",
       len(eng_e.ema50_history) >= engine.EMA_SLOPE_LOOKBACK, f"{len(eng_e.ema50_history)} loaded")
 check("E: trade stats loaded from trades.csv", eng_e.wins == 1 and eng_e.losses == 0)
+
+# Mid-trade restart regression (2026-11-17 duplicate Trade_Num #7):
+# closed #1 in trades.csv -> open #2 -> restart -> restore #2 -> close #2 -> open #3.
+eng_e.atr = 40.0
+eng_e.rsi = 45.0
+eng_e.ema_fast = 20000.0
+eng_e.ema_slow = 20100.0
+with redirect_stdout(io.StringIO()):
+    eng_e.execute_simulated_trade("SELL", 20000.0, 0.50, "2026-11-17 02:15:00")
+    eng_e2 = engine.NasdaqEngine()
+check("E: mid-trade restart restores Trade_Num #2 and advances next_trade_num to #3",
+      eng_e2.trade_active and eng_e2.current_trade_num == 2 and eng_e2.next_trade_num == 3,
+      f"cur={eng_e2.current_trade_num} next={eng_e2.next_trade_num}")
+eng_e2.atr = 40.0
+eng_e2.rsi = 45.0
+eng_e2.ema_fast = 19900.0
+eng_e2.ema_slow = 20100.0
+with redirect_stdout(io.StringIO()):
+    _e_closed2 = eng_e2.close_simulated_trade(eng_e2.take_profit, "TP")
+    eng_e2.execute_simulated_trade("SELL", 19900.0, 0.55, "2026-11-17 21:15:00")
+    _e_num3 = eng_e2.current_trade_num
+    _e_closed3 = eng_e2.close_simulated_trade(eng_e2.stop_loss, "SL")
+    # Duplicate guard: forcing current_trade_num=3 and closing must refuse to append.
+    eng_e2.trade_active = True
+    eng_e2.current_trade_num = 3
+    _e_dup = eng_e2.close_simulated_trade(19980.0, "SL")
+with open(engine.TRADES_LOG_PATH, newline="") as _ef:
+    _e_nums = [r["Trade_Num"] for r in csv.DictReader(_ef)]
+check("E: post-restore close + next entry numbers strictly (#1,#2,#3) and refuses duplicates",
+      _e_closed2 and _e_num3 == 3 and _e_closed3 and not _e_dup
+      and _e_nums == ["1", "2", "3"] and eng_e2.next_trade_num == 4,
+      f"nums={_e_nums} next={eng_e2.next_trade_num} dup={_e_dup}")
 shutil.rmtree(tmp_c, ignore_errors=True)
 
 # ==============================================================================
@@ -781,6 +813,12 @@ check("O: dashboard.py reads the feed verdict + sidecar heartbeat and renders a 
       and "MT5_FEED_HEALTH_FILE" in dash_src
       and '{% if feed and not feed.ok %}' in dash_src
       and "tools/feed_doctor.py" in dash_src)
+
+check("O: dashboard.py surfaces read-only autosync last run age on /readiness (STALE > 45 min)",
+      "AUTOSYNC_HEARTBEAT_FILE" in dash_src and "AUTOSYNC_STALE_SECONDS = 45 * 60" in dash_src
+      and "def autosync_status(" in dash_src and "Autosync last run age" in dash_src
+      and "HEARTBEAT_FILE=" in open(os.path.join(HERE, "autosync.sh"), encoding="utf-8").read()
+      and "write_heartbeat" in open(os.path.join(HERE, "autosync.sh"), encoding="utf-8").read())
 
 auto_src = open(os.path.join(HERE, "autosync.sh"), encoding="utf-8").read()
 check("O: autosync.sh targets /opt/nasdaq and uses static mt5quotes-nasdaq STALE alert for alert_once dedupe",
@@ -1344,6 +1382,25 @@ except Exception:
     _actions_ok = False
 check("R: feed_doctor --json exposes actions.restart_sidecar (autosync self-heal gate)",
       _actions_ok, _doc_json.stdout[:120])
+
+with open(os.path.join(_healthy, "mt5_feed_health.json"), "w") as fh:
+    json.dump(feed_mod.build_health_payload("OK", symbol="US100Cash", account="12345678",
+                                            connected=True, tick_age_s=1.0, server_offset_s=7200,
+                                            reconnects=9, started_epoch=_n2 - 7 * 3600), fh)
+_doc_churn = subprocess.run([sys.executable, os.path.join(HERE, "feed_doctor.py"),
+                             "--data-dir", _healthy, "--assume-open", "--json"],
+                            cwd=ROOT, capture_output=True, text=True, timeout=60)
+try:
+    _jrc = json.loads(_doc_churn.stdout)
+    _churn_ok = (_doc_churn.returncode == 0
+                 and _jrc["verdict"][0] == "OK"
+                 and "feed flowing" in _jrc["verdict"][1]
+                 and _jrc["reconnect_churn"]["elevated"] is True
+                 and len(_jrc.get("advisories") or []) == 1)
+except Exception:
+    _churn_ok = False
+check("R: feed_doctor keeps flowing feed OK and reports reconnect churn as its own advisory",
+      _churn_ok, _doc_churn.stdout[:160])
 
 shutil.rmtree(tmp_r, ignore_errors=True)
 
