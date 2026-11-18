@@ -3,8 +3,8 @@
 <!-- HANDOFF-SNAPSHOT machine-checked by tools/handoff_check.py; refresh with --update -->
 | key | value |
 |---|---|
-| as_of_utc | 2026-11-18 13:36 |
-| data_collection | 5247 |
+| as_of_utc | 2026-11-18 13:45 |
+| data_collection | 5248 |
 | closed_trades | 8 |
 | wins_losses | 3W/5L |
 | win_rate_pct | 37.5 |
@@ -13,8 +13,8 @@
 | live_era_trades | 8 |
 | live_era_net_usd | +4.27 |
 | log_covered_trades | 8 |
-| log_bars | 1383 |
-| log_last_bar_utc | 2026-11-18 13:30 |
+| log_bars | 1384 |
+| log_last_bar_utc | 2026-11-18 13:45 |
 | skip_rows | 0 |
 | open_trade | none |
 | spread_usd_per_trade | 0.25 |
