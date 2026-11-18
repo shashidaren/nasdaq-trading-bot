@@ -226,7 +226,8 @@ class DashboardTests(unittest.TestCase):
                            ("STATUS_FILE_PATH", "status.json"),
                            ("JOURNAL_FILE_PATH", "journal.csv"),
                            ("MT5_FEED_FILE", "mt5_last_candle.json"),
-                           ("MT5_FEED_HEALTH_FILE", "mt5_feed_health.json")):
+                           ("MT5_FEED_HEALTH_FILE", "mt5_feed_health.json"),
+                           ("AUTOSYNC_HEARTBEAT_FILE", "autosync_heartbeat.json")):
             patcher = mock.patch.object(dashboard, name, str(self.root / file))
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -401,6 +402,84 @@ class DashboardTests(unittest.TestCase):
             write_csv(self.root / "trades.csv", TRADE_FIELDS, self.trade_rows)
             self.client.get("/readiness")
             self.assertEqual(evaluate.call_count, 2)
+
+    def test_autosync_last_run_age_renders_read_only_and_flags_stale_over_45m(self):
+        """2026-11-17->18: commented-out cron + NOTIFY=off hid a stopped autosync."""
+        hb_path = self.root / "autosync_heartbeat.json"
+
+        def card_html():
+            resp = self.client.get("/readiness")
+            self.assertEqual(resp.status_code, 200)
+            body = unescape(resp.get_data(as_text=True))
+            match = re.search(r'<div data-card="autosync".*?</div>', body, re.DOTALL)
+            self.assertIsNotNone(match, "autosync card missing from /readiness")
+            return match.group()
+
+        # 1. Missing stamp -> NO HEARTBEAT, read-only (never created).
+        card = card_html()
+        self.assertIn("Autosync last run age", card)
+        self.assertIn("NO HEARTBEAT", card)
+        self.assertIn("stale > 45 min", card)
+        self.assertFalse(hb_path.exists())
+
+        def write_stamp(age_s, status="ok", exit_code=0, **extra):
+            ts = NOW.timestamp() - age_s
+            dt_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            payload = {
+                "ts_utc": dt_str, "ts_epoch": ts, "status": status, "exit_code": exit_code,
+                "phase": "done", "push": "ok", "deploy": "none", "notify": "off",
+            }
+            payload.update(extra)
+            raw = json.dumps(payload, indent=2) + "\n"
+            hb_path.write_text(raw, encoding="utf-8")
+            return raw
+
+        # 2. Fresh stamp (12 min old) and exact 45-min boundary -> OK, surfaces notify: off.
+        raw_fresh = write_stamp(12 * 60)
+        card = card_html()
+        self.assertIn("OK · 12 min ago", card)
+        self.assertIn("push: ok", card)
+        self.assertIn("notify: off", card)
+        self.assertEqual(hb_path.read_text(encoding="utf-8"), raw_fresh)
+
+        write_stamp(45 * 60)
+        self.assertIn("OK · 45 min ago", card_html())
+
+        # 3. Over 45 min (45m 01s, 46 min, and 14 h) -> STALE, read-only.
+        write_stamp(45 * 60 + 1)
+        card = card_html()
+        self.assertIn("STALE · 45m 01s ago", card)
+        self.assertIn("Older than 45 min", card)
+
+        raw_stale = write_stamp(46 * 60)
+        card = card_html()
+        self.assertIn("STALE · 46 min ago", card)
+        self.assertIn("crontab", card)
+        self.assertEqual(hb_path.read_text(encoding="utf-8"), raw_stale)
+
+        write_stamp(14 * 3600)
+        self.assertIn("STALE · 14.0 h ago", card_html())
+
+        # 4. Fresh warn / error / future / corrupt stamps never masquerade as OK.
+        write_stamp(5 * 60, status="warn", push="FAILED")
+        card = card_html()
+        self.assertIn("WARN · 5 min ago", card)
+        self.assertIn("push: FAILED", card)
+
+        write_stamp(3 * 60, status="error", exit_code=1, phase="preflight")
+        card = card_html()
+        self.assertIn("ERROR · 3 min ago", card)
+        self.assertIn("exit 1 (preflight)", card)
+
+        write_stamp(-600)
+        card = card_html()
+        self.assertIn("STALE · clock skew", card)
+        self.assertIn("in the future", card)
+
+        hb_path.write_text("{truncated", encoding="utf-8")
+        card = card_html()
+        self.assertIn("UNREADABLE", card)
+        self.assertEqual(hb_path.read_text(encoding="utf-8"), "{truncated")
 
 
 if __name__ == "__main__":

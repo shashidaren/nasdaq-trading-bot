@@ -192,47 +192,123 @@ class IpcFailureGuidanceTests(unittest.TestCase):
         self.assertIn("none - feed is healthy", buf.getvalue())
 
 
-class ReconnectChurnGateTests(unittest.TestCase):
+class ReconnectChurnAdvisoryTests(unittest.TestCase):
+    """Separate a flowing feed with elevated reconnect churn from real staleness."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         now = datetime.now(timezone.utc)
         self.now = now.timestamp()
+        # Closed M15 bar whose close time was 2 minutes ago (open = now - 17 min).
+        self._write_bar(age_after_close_s=2 * 60)
+
+    def _write_bar(self, age_after_close_s: int):
         feed = {"symbol": "US100Cash", "timeframe": "M15", "account": "1",
-                "ts": int((now - timedelta(minutes=15)).timestamp()),
+                "ts": int(self.now - (15 * 60 + age_after_close_s)),
                 "server_offset_s": 7200, "open": 20000.0, "high": 20010.0,
                 "low": 19990.0, "close": 20005.0, "tick_volume": 100}
         (self.root / "mt5_last_candle.json").write_text(json.dumps(feed), encoding="utf-8")
 
-    def report(self, reconnects, uptime_s):
+    def report(self, reconnects, uptime_s, assume_open=True, now_epoch=None):
+        ts = self.now if now_epoch is None else now_epoch
         health = {"status": "OK", "symbol": "US100Cash", "timeframe": "M15",
-                  "account": "1", "heartbeat_epoch": self.now,
+                  "account": "1", "heartbeat_epoch": ts,
                   "server_offset_s": 7200, "tick_age_s": 1.0,
                   "reconnects": reconnects, "uptime_s": uptime_s,
                   "last_error": None}
         (self.root / "mt5_feed_health.json").write_text(json.dumps(health), encoding="utf-8")
-        return feed_doctor.build_report(str(self.root), None, now_epoch=self.now,
-                                        assume_open=True)
+        os.utime(self.root / "mt5_feed_health.json", (ts, ts))
+        return feed_doctor.build_report(str(self.root), None, now_epoch=ts,
+                                        assume_open=assume_open)
 
-    def test_large_process_lifetime_reconnect_rate_is_stale_even_with_fresh_bar(self):
-        # VPS incident: 3,460 reconnects across 12.5 days is about 11.53/hour.
+    def test_flowing_feed_with_elevated_churn_is_ok_with_advisory_not_stale(self):
+        # 2026-11-18 VPS case: 9 reconnects over 7.0 h = 1.29/h vs 1.00/h, 2-min-old bar.
+        report = self.report(9, 7 * 3600)
+        churn = report["reconnect_churn"]
+        self.assertEqual(churn["rate_per_hour"], 1.29)
+        self.assertTrue(churn["elevated"])
+        self.assertIsNotNone(churn["advisory"])
+        self.assertEqual(report["advisories"], [churn["advisory"]])
+        self.assertEqual(report["verdict"][0], "OK")
+        self.assertIn("feed flowing", report["verdict"][1])
+        self.assertIn("1.29/h > 1.00/h", report["verdict"][1])
+        self.assertNotIn("feed healthy", report["verdict"][1])
+        self.assertIn("1.29/h", " ".join(report["verdict"][2]))
+        self.assertIsNone(report["actions"]["restart_sidecar"])
+
+        # CLI exits 0 (not 1/STALE) and surfaces the advisory line explicitly.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = feed_doctor.main(["--data-dir", str(self.root), "--assume-open"])
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("verdict     : OK - feed flowing (reconnect churn advisory: 1.29/h > 1.00/h)", out)
+        self.assertIn("advisory    : sidecar reconnect churn elevated:", out)
+        self.assertIn("[ADVISORY > 1.00/h]", out)
+        self.assertNotIn("none - feed is healthy", out)
+
+    def test_high_lifetime_churn_with_fresh_bar_reports_advisory_without_faking_stale(self):
+        # 3,460 reconnects across 12.5 days = 11.53/h while bars are still flowing.
         report = self.report(3460, 12.5 * 24 * 3600)
-        self.assertGreater(report["reconnect_churn"]["rate_per_hour"], 1.0)
-        self.assertTrue(report["reconnect_churn"]["degraded"])
-        self.assertEqual(report["verdict"][0], "STALE")
-        self.assertIn("reconnect churn", report["verdict"][1])
-        self.assertIn("11.53/h", " ".join(report["verdict"][2]))
+        self.assertEqual(report["reconnect_churn"]["rate_per_hour"], 11.53)
+        self.assertTrue(report["reconnect_churn"]["elevated"])
+        self.assertEqual(report["verdict"][0], "OK")
+        self.assertIn("reconnect churn advisory: 11.53/h", report["verdict"][1])
+        self.assertIn("11.53/h", report["advisories"][0])
 
-    def test_isolated_reconnect_does_not_trip_gate(self):
+    def test_genuinely_stale_bar_stays_stale_and_includes_churn_advisory(self):
+        self._write_bar(age_after_close_s=45 * 60)
+        report_no_churn = self.report(0, 7 * 3600)
+        self.assertEqual(report_no_churn["verdict"][0], "STALE")
+        self.assertEqual(report_no_churn["advisories"], [])
+
+        report_with_churn = self.report(9, 7 * 3600)
+        self.assertEqual(report_with_churn["verdict"][0], "STALE")
+        self.assertIn("CANDLE_OLD", report_with_churn["verdict"][1])
+        self.assertTrue(report_with_churn["reconnect_churn"]["elevated"])
+        self.assertEqual(len(report_with_churn["advisories"]), 1)
+        self.assertIn("1.29/h", " ".join(report_with_churn["verdict"][2]))
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = feed_doctor.main(["--data-dir", str(self.root), "--assume-open"])
+        self.assertEqual(rc, 1)
+        self.assertIn("verdict     : STALE -", buf.getvalue())
+        self.assertIn("advisory    : sidecar reconnect churn elevated:", buf.getvalue())
+
+    def test_broken_and_quiet_verdicts_are_not_overridden_by_churn(self):
+        (self.root / "mt5_last_candle.json").unlink()
+        broken = self.report(9, 7 * 3600)
+        self.assertEqual(broken["verdict"][0], "BROKEN")
+        self.assertTrue(broken["reconnect_churn"]["elevated"])
+        self.assertEqual(len(broken["advisories"]), 1)
+
+        saturday = datetime(2026, 10, 31, 12, 0, tzinfo=timezone.utc).timestamp()
+        feed = {"symbol": "US100Cash", "timeframe": "M15", "account": "1",
+                "ts": int(saturday - 4 * 3600),
+                "server_offset_s": 7200, "open": 20000.0, "high": 20010.0,
+                "low": 19990.0, "close": 20005.0, "tick_volume": 100}
+        (self.root / "mt5_last_candle.json").write_text(json.dumps(feed), encoding="utf-8")
+        quiet = self.report(9, 7 * 3600, assume_open=False, now_epoch=saturday)
+        self.assertEqual(quiet["verdict"][0], "QUIET")
+        self.assertTrue(quiet["reconnect_churn"]["elevated"])
+        self.assertEqual(len(quiet["advisories"]), 1)
+
+    def test_isolated_reconnect_does_not_trip_advisory(self):
         report = self.report(1, 24 * 3600)
-        self.assertFalse(report["reconnect_churn"]["degraded"])
+        self.assertFalse(report["reconnect_churn"]["elevated"])
+        self.assertEqual(report["advisories"], [])
         self.assertEqual(report["verdict"][0], "OK")
+        self.assertIn("feed healthy", report["verdict"][1])
 
-    def test_short_startup_window_does_not_trip_gate(self):
+    def test_short_startup_window_does_not_trip_advisory(self):
         report = self.report(3, 10 * 60)
-        self.assertFalse(report["reconnect_churn"]["degraded"])
+        self.assertFalse(report["reconnect_churn"]["elevated"])
+        self.assertEqual(report["advisories"], [])
         self.assertEqual(report["verdict"][0], "OK")
+        self.assertIn("feed healthy", report["verdict"][1])
 
 
 class RestartActionTests(unittest.TestCase):

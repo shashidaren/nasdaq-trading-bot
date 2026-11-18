@@ -14,6 +14,7 @@ import csv
 import json
 import os
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 ROOT = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -138,12 +139,22 @@ def check_trades():
 
     trades = []
     nums, bad_reason, bad_side, bad_time = [], 0, 0, 0
-    for r in rows:
+    blank_num_lines, bad_num_rows = [], []
+    for lineno, r in enumerate(rows, start=2):
         if len(r) != len(TRADES_FIELDS):
             continue
         d = dict(zip(TRADES_FIELDS, r))
+        raw_num = str(d["Trade_Num"]).strip().replace(",", "")
+        if not raw_num:
+            blank_num_lines.append(lineno)
+            continue
         try:
-            d["num"] = int(str(d["Trade_Num"]).replace(",", ""))
+            d["num"] = int(raw_num)
+        except ValueError:
+            bad_num_rows.append((lineno, d["Trade_Num"]))
+            continue
+        nums.append(d["num"])
+        try:
             d["profit"] = fnum(d["Profit"])
             d["bal"] = fnum(d["Balance_After"])
             d["entry_dt"] = parse_dt(d["Entry_Time"])
@@ -153,7 +164,6 @@ def check_trades():
         except ValueError:
             bad_reason += 1
             continue
-        nums.append(d["num"])
         if d["Trade_Type"] not in ("BUY", "SELL"):
             bad_side += 1
         if d["Exit_Reason"] not in ("TP", "SL"):
@@ -172,11 +182,58 @@ def check_trades():
     else:
         ok("entry/exit times ordered")
 
-    dup = len(nums) - len(set(nums))
-    if dup:
-        warn(f"{dup} duplicate Trade_Num values")
-    else:
-        ok("trade numbering unique")
+    num_failed = False
+    if blank_num_lines:
+        named = ", ".join(str(ln) for ln in blank_num_lines[:10])
+        if len(blank_num_lines) > 10:
+            named += f" ... (+{len(blank_num_lines) - 10} more)"
+        fail(f"{len(blank_num_lines)} row(s) with missing/blank Trade_Num at line(s) {named}")
+        num_failed = True
+    if bad_num_rows:
+        named = ", ".join(f"line {ln} ({val!r})" for ln, val in bad_num_rows[:10])
+        if len(bad_num_rows) > 10:
+            named += f" ... (+{len(bad_num_rows) - 10} more)"
+        fail(f"{len(bad_num_rows)} row(s) with unparsable Trade_Num: {named}")
+        num_failed = True
+
+    non_pos = sorted({n for n in nums if n < 1})
+    if non_pos:
+        named = ", ".join(f"#{n}" for n in non_pos[:10])
+        fail(f"{len(non_pos)} non-positive Trade_Num value(s): {named}")
+        num_failed = True
+
+    counts = Counter(nums)
+    dup_nums = sorted(n for n, cnt in counts.items() if cnt > 1)
+    if dup_nums:
+        dup_extra = sum(counts[n] - 1 for n in dup_nums)
+        named = ", ".join(f"#{n} (x{counts[n]})" for n in dup_nums[:10])
+        if len(dup_nums) > 10:
+            named += f" ... (+{len(dup_nums) - 10} more)"
+        fail(f"{dup_extra} duplicate Trade_Num value(s): {named}")
+        num_failed = True
+
+    pos_nums = {n for n in nums if n >= 1}
+    if pos_nums:
+        max_num = max(pos_nums)
+        missing_nums = [n for n in range(1, max_num + 1) if n not in pos_nums]
+        if missing_nums:
+            named = ", ".join(f"#{n}" for n in missing_nums[:10])
+            if len(missing_nums) > 10:
+                named += f" ... (+{len(missing_nums) - 10} more)"
+            fail(f"{len(missing_nums)} missing Trade_Num value(s) in #1..#{max_num}: {named}")
+            num_failed = True
+
+    regress = [(a, b) for a, b in zip(nums, nums[1:]) if b < a]
+    if regress:
+        named = ", ".join(f"#{a}->#{b}" for a, b in regress[:10])
+        if len(regress) > 10:
+            named += f" ... (+{len(regress) - 10} more)"
+        fail(f"{len(regress)} out-of-order Trade_Num transition(s): {named} (must be strictly increasing)")
+        num_failed = True
+
+    if not num_failed:
+        span = f" (#1..#{nums[-1]})" if nums else " (0 rows)"
+        ok(f"trade numbering unique, strictly increasing, and contiguous{span}")
 
     breaks = 0
     for prev, cur in zip(trades, trades[1:]):

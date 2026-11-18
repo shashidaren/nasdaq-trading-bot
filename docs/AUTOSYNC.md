@@ -18,7 +18,7 @@ Before interpreting any Git output or touching tracked data, autosync runs `git 
    - `dead-handle` — heartbeat present and fresh, but the MT5 handle is dead (`last_error` mentions IPC / `-10004`, or status is `NO_RATES` / `INIT_FAILED` / `SYMBOL_SELECT_FAILED`). This is the 2026-10-30→11-02 incident: the sidecar process stayed alive and heartbeat-fresh over a frozen feed file for 2.7 days because nothing ever restarted it.
    - `not-running` — feed file and heartbeat both missing, **and** systemd does not report `inactive`/`deactivating` (a deliberate operator stop is never overridden).
 
-   The restart only fires against an open-market `STALE`/`BROKEN` verdict: `OK` and `QUIET` (weekends, 16:55–18:10 ET maintenance) are never restarted; a stale heartbeat (the unit may be deliberately stopped) is never restarted; a configuration problem (foreign writer / wrong `MT5_FEED_FILE`) is alerted but not restarted, because a restart would loop without fixing it. After a restart (`FEED_HEAL_WAIT_S`, default 20 s) the doctor runs again: recovery is logged, no recovery adds a `⚠️` digest line with `journalctl` guidance, and the next cron run tries again. If `systemctl` finds no matching unit, autosync logs `feed service NOT FOUND - restart feed sidecar manually` instead of guessing a target. Set `FEED_SELF_HEAL=0` to disable auto-restarts entirely.
+   The restart only fires against an open-market `STALE`/`BROKEN` verdict: `OK` (including `OK` with a reconnect-churn advisory, which is logged without restarting) and `QUIET` (weekends, 16:55–18:10 ET maintenance) are never restarted; a stale heartbeat (the unit may be deliberately stopped) is never restarted; a configuration problem (foreign writer / wrong `MT5_FEED_FILE`) is alerted but not restarted, because a restart would loop without fixing it. After a restart (`FEED_HEAL_WAIT_S`, default 20 s) the doctor runs again: recovery is logged, no recovery adds a `⚠️` digest line with `journalctl` guidance, and the next cron run tries again. If `systemctl` finds no matching unit, autosync logs `feed service NOT FOUND - restart feed sidecar manually` instead of guessing a target. Set `FEED_SELF_HEAL=0` to disable auto-restarts entirely.
 
 ## Live-Data Preservation (why there is no `git reset --hard`)
 
@@ -37,6 +37,7 @@ The current flow makes data loss structurally impossible in the tested paths:
    - `python3 tools/handoff_check.py --quiet` (`docs/HANDOFF.md` freshness)
    - `python3 tools/xm_quote_report.py --quiet` (`mt5quotes-nasdaq` liveness, market-hours aware)
 6. **Optional Telegram Digest** (`NOTIFY=off|quiet|alerts|always`; static alert text on `STALE` so `alert_once` deduplicates cleanly).
+7. **Heartbeat stamp (`HEARTBEAT_FILE`, default `$NASDAQ_DIR/autosync_heartbeat.json`):** atomically written via an `EXIT` trap on every locked run (gitignored so it never dirties the worktree or causes data-merge conflicts), recording `ts_utc`, `ts_epoch`, `status` (`ok`/`warn`/`error`), `exit_code`, `phase`, `push`, `deploy`, `feed`, `check`, and `notify`. `dashboard.py` reads `AUTOSYNC_HEARTBEAT_FILE` strictly read-only and surfaces **Autosync last run age** on `/readiness` (`STALE` when older than 45 min), so a commented-out cron line or `NOTIFY=off` silence is visible immediately.
 
 ## Cron Setup
 
