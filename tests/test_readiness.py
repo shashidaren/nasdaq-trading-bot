@@ -375,6 +375,18 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("Gate results unavailable", text)
         self.assertIn("Unavailable", text)
 
+    def test_torn_log_row_fails_closed_and_names_the_repair_command(self):
+        """2026-11-18: NUL padding made the tab useless without saying why or how to fix it."""
+        path = self.root / "forward_test_log.csv"
+        lines = path.read_bytes().split(b"\n")
+        lines[2] = b"\x00" * 140 + lines[2]
+        path.write_bytes(b"\n".join(lines))
+        text = self.client.get("/readiness").get_data(as_text=True)
+        self.assertIn("NOT READY — EVIDENCE UNAVAILABLE", text)
+        self.assertIn("Readiness could not be computed", text)
+        self.assertIn("140 NUL byte(s) starting at line 3", text)
+        self.assertIn("tools/repair_log.py --apply", text)
+
     def test_cache_invalidates_when_evidence_changes_but_feed_is_always_live(self):
         with mock.patch.object(LR, "evaluate_data_gates", wraps=LR.evaluate_data_gates) as evaluate:
             self.client.get("/readiness")
