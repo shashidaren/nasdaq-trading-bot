@@ -3,20 +3,20 @@
 <!-- HANDOFF-SNAPSHOT machine-checked by tools/handoff_check.py; refresh with --update -->
 | key | value |
 |---|---|
-| as_of_utc | 2026-11-17 09:30 |
-| data_collection | 5244 |
-| closed_trades | 6 |
-| wins_losses | 2W/4L |
-| win_rate_pct | 33.3 |
-| engine_ledger_usd | 194.22 |
-| true_equity_usd | 194.23 |
-| live_era_trades | 6 |
-| live_era_net_usd | -7.27 |
-| log_covered_trades | 6 |
-| log_bars | 1276 |
-| log_last_bar_utc | 2026-11-17 09:30 |
+| as_of_utc | 2026-11-18 13:36 |
+| data_collection | 5247 |
+| closed_trades | 8 |
+| wins_losses | 3W/5L |
+| win_rate_pct | 37.5 |
+| engine_ledger_usd | 206.27 |
+| true_equity_usd | 206.27 |
+| live_era_trades | 8 |
+| live_era_net_usd | +4.27 |
+| log_covered_trades | 8 |
+| log_bars | 1383 |
+| log_last_bar_utc | 2026-11-18 13:30 |
 | skip_rows | 0 |
-| open_trade | SELL #7 @ 27292.4 |
+| open_trade | none |
 | spread_usd_per_trade | 0.25 |
 <!-- /HANDOFF-SNAPSHOT -->
 
