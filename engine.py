@@ -186,6 +186,37 @@ def latest_closed_candle_ts(rates):
     return int(rates[0]["time"])
 
 
+def ensure_appendable_log(path):
+    """Check the tail before appending: never glue a row onto a partial line.
+
+    A torn/sparse write leaves NUL padding inside the CSV, which every strict
+    reader then rejects ("has NUL byte(s)"). The engine cannot repair that
+    safely, but it can stop making it worse: a torn final row would otherwise
+    swallow the next append. Returns a short description of what was found
+    ("" when the tail is clean) so the caller can journal it.
+    """
+    try:
+        size = os.path.getsize(path)
+        if not size:
+            return ""
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - 4096))
+            tail = fh.read()
+    except OSError:
+        return ""
+    problems = []
+    if b"\x00" in tail:
+        problems.append("NUL padding (torn write)")
+    if not tail.endswith(b"\n"):
+        try:
+            with open(path, "ab") as fh:
+                fh.write(b"\n")
+        except OSError:
+            return "unterminated final row (could not add a newline)"
+        problems.append("unterminated final row (newline added)")
+    return "; ".join(problems)
+
+
 def last_logged_candle_close_ts(path=None):
     """Read the newest log Timestamp as a UTC candle-close watermark."""
     path = LOG_FILE_PATH if path is None else path
@@ -886,6 +917,11 @@ class NasdaqEngine:
 
     def log_candle(self, timestamp, o, h, l, c, ratio, tick_count, vol_ma, dynamic_floor, ema_f, ema_s, tested, rejected, held, vol_conf, trend_conf, rsi_val, atr_val):
         file_exists = os.path.isfile(LOG_FILE_PATH)
+        torn = ensure_appendable_log(LOG_FILE_PATH)
+        if torn:
+            print(f"WARNING: {LOG_FILE_PATH}: {torn} - run "
+                  f"`python3 tools/repair_log.py --check` (readiness fails closed on it)",
+                  flush=True)
         os.makedirs(os.path.dirname(LOG_FILE_PATH) or ".", exist_ok=True)
         with open(LOG_FILE_PATH, mode="a", newline="") as f:
             writer = csv.DictWriter(

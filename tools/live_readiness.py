@@ -243,12 +243,41 @@ def line(label, ts, spread):
 
 
 # --------------------------------------------------------------------------- #
+def torn_write_report(path):
+    """Byte-level scan for NUL padding: a NUL is never legal in these CSVs.
+
+    A crash, a full disk, or a merge/rollback racing an append can leave the row
+    bytes intact but preceded by NULs, so the row no longer starts at column 0.
+    Returns (nul_bytes, line, column) for the first NUL, else None. Read-only.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if b"\x00" not in data:
+        return None
+    first = data.index(b"\x00")
+    return data.count(b"\x00"), data.count(b"\n", 0, first) + 1, first - (data.rfind(b"\n", 0, first) + 1)
+
+
 def load_readiness_data(trades_path, log_path):
     """Read the evidence conservatively; never silently discard malformed rows.
 
     replay_lib's permissive loaders are useful for exploration, but silently
     skipping a losing trade or a bad bar could make a go-live gate look better.
+    Torn writes are named explicitly (file/line/column) with the repair command,
+    because the strict failure below is otherwise indistinguishable from a
+    genuinely malformed row.
     """
+    for path in (trades_path, log_path):
+        torn = torn_write_report(path)
+        if torn:
+            total, line, column = torn
+            raise ValueError(
+                f"{os.path.basename(path)} has {total} NUL byte(s) starting at line {line}, "
+                f"column {column} - a torn or partial write left the row padded, so it no "
+                f"longer starts at column 0. The row values are intact, but this loader will "
+                f"not guess. Repair without changing values: run python3 tools/repair_log.py "
+                f"--check, then python3 tools/repair_log.py --apply")
+
     def read_rows(path, required):
         with open(path, newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
@@ -286,16 +315,18 @@ def load_readiness_data(trades_path, log_path):
                 or t["reason"] not in ("TP", "SL")):
             raise ValueError(f"trades.csv has invalid values for trade {t['num']}")
     last = None
-    for row in log_rows:
+    for offset, row in enumerate(log_rows):
         dt = R.parse_ts(row.get("Timestamp"))
         values = [R.fnum(row.get(k)) for k in ("Open", "High", "Low", "Close")]
         if (dt is None or dt.minute % 15 or dt.second
                 or (last is not None and dt <= last)
                 or any(v is None or not math.isfinite(v) for v in values)):
-            raise ValueError("forward_test_log.csv has invalid, duplicate, or unordered M15 bars")
+            raise ValueError(f"forward_test_log.csv has invalid, duplicate, or unordered M15 "
+                             f"bars at line {offset + 2} (Timestamp={row.get('Timestamp')!r})")
         o, h, low, c = values
         if low > min(o, c) or h < max(o, c) or low <= 0:
-            raise ValueError("forward_test_log.csv has invalid OHLC values")
+            raise ValueError(f"forward_test_log.csv has invalid OHLC values at line {offset + 2} "
+                             f"(Timestamp={row.get('Timestamp')!r})")
         last = dt
     return trades, bars
 
