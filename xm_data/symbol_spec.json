@@ -14,7 +14,7 @@
     "trade_expert": true,
     "trade_mode": 2
   },
-  "captured_utc": "2026-11-20 21:41:51",
+  "captured_utc": "2026-11-21 03:41:51",
   "decoded": {
     "account_kind": "REAL",
     "calc_mode": "CFD_LEVERAGE",
@@ -47,10 +47,10 @@
   "probes": {
     "calc_margin_usd_0.10lot": 2.52,
     "calc_profit_usd_0.10lot_plus_100pts": 10.0,
-    "price_used": 25232.95
+    "price_used": 25215.78
   },
   "schema": 1,
-  "spread_points_now": 290,
+  "spread_points_now": 494,
   "symbol": "US100Cash",
   "symbol_info": {
     "currency_base": "USD",
