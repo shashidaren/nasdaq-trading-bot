@@ -14,7 +14,7 @@
     "trade_expert": true,
     "trade_mode": 2
   },
-  "captured_utc": "2026-11-22 21:42:06",
+  "captured_utc": "2026-11-23 03:42:11",
   "decoded": {
     "account_kind": "REAL",
     "calc_mode": "CFD_LEVERAGE",
@@ -45,12 +45,12 @@
   "hash": "c78f94b7d639",
   "label": "XM US100Cash",
   "probes": {
-    "calc_margin_usd_0.10lot": 2.52,
+    "calc_margin_usd_0.10lot": 2.58,
     "calc_profit_usd_0.10lot_plus_100pts": 10.0,
-    "price_used": 25215.78
+    "price_used": 25826.4
   },
   "schema": 1,
-  "spread_points_now": 494,
+  "spread_points_now": 445,
   "symbol": "US100Cash",
   "symbol_info": {
     "currency_base": "USD",
