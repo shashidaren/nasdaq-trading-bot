@@ -12,7 +12,7 @@
   "active_position_id": null,
   "daily_losses": 1,
   "max_daily_losses": 3,
-  "last_update": "2026-11-26 20:07:18",
+  "last_update": "2026-11-26 20:27:41",
   "feed": {
     "ok": false,
     "reason": "CANDLE_OLD",
@@ -20,18 +20,18 @@
     "path": "/opt/nasdaq/mt5_last_candle.json",
     "symbol": "US100Cash",
     "candle_open_utc": "2026-11-26 17:30:00",
-    "candle_age_s": 8538.6,
+    "candle_age_s": 9761.4,
     "frozen_since_utc": "2026-11-26 17:45:00",
-    "file_age_s": 7.9,
+    "file_age_s": 8.1,
     "sidecar": {
       "status": "TICK_FROZEN",
-      "heartbeat_age_s": 7.9,
+      "heartbeat_age_s": 8.1,
       "fresh": true,
-      "tick_age_s": 7931.7,
+      "tick_age_s": 9154.3,
       "server_offset_s": 7200,
-      "last_error": "terminal tick is 132 min old - no live data (session kicked? second terminal on the same login?)"
+      "last_error": "terminal tick is 153 min old - no live data (session kicked? second terminal on the same login?)"
     },
-    "checked_utc": "2026-11-26 20:07:18"
+    "checked_utc": "2026-11-26 20:27:41"
   },
   "rsi": 40.9,
   "ema_fast": 26186.31,
